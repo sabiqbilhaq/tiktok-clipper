@@ -1,8 +1,8 @@
-import traceback
 import os
 import json
 import uuid
 import shutil
+import traceback
 import subprocess
 import requests
 from flask import Flask, render_template, request, jsonify
@@ -22,7 +22,7 @@ def download_youtube(url, job_id):
     audio_path = os.path.join(DOWNLOAD_DIR, f"{job_id}.mp3")
 
     cookie_args = []
-    yt_cookies = os.environ.get("YOUTUBE_COOKIES", "").strip()
+    yt_cookies = (os.environ.get("YOUTUBE_COOKIES") or "").strip()
     if yt_cookies:
         cookie_path = os.path.join(DOWNLOAD_DIR, "cookies.txt")
         with open(cookie_path, "w", encoding="utf-8") as cf:
@@ -40,7 +40,8 @@ def download_youtube(url, job_id):
     ]
     res = subprocess.run(cmd_vid, capture_output=True, text=True)
     if res.returncode != 0:
-        raise RuntimeError(f"Gagal unduh YouTube: {res.stderr.strip().splitlines()[-1]}")
+        err_tail = " | ".join(res.stderr.strip().splitlines()[-3:])
+        raise RuntimeError(f"yt-dlp gagal: {err_tail}")
 
     cmd_aud = [
         FFMPEG_BIN, "-y",
@@ -48,7 +49,10 @@ def download_youtube(url, job_id):
         "-vn", "-ac", "1", "-ar", "16000", "-b:a", "48k",
         audio_path
     ]
-    subprocess.run(cmd_aud, check=True)
+    res_aud = subprocess.run(cmd_aud, capture_output=True, text=True)
+    if res_aud.returncode != 0:
+        raise RuntimeError(f"FFmpeg audio gagal: {res_aud.stderr[-300:]}")
+
     return video_path, audio_path
 
 
@@ -64,8 +68,11 @@ def transcribe_groq(audio_path, groq_key):
         }
         resp = requests.post(url, headers=headers, files=files, data=data, timeout=300)
         if resp.status_code != 200:
-            raise RuntimeError(f"Groq Error ({resp.status_code}): {resp.text[:250]}")
-        return resp.json()
+            raise RuntimeError(f"Groq Error ({resp.status_code}): {resp.text[:300]}")
+        parsed = resp.json()
+        if not isinstance(parsed, dict):
+            raise RuntimeError(f"Groq mengembalikan format tidak terduga: {type(parsed)}")
+        return parsed
 
 
 def extract_words_safe(transcript_json):
@@ -74,7 +81,7 @@ def extract_words_safe(transcript_json):
 
     raw_words = transcript_json.get("words")
     if isinstance(raw_words, list) and len(raw_words) > 0:
-        return raw_words
+        return [w for w in raw_words if isinstance(w, dict)]
 
     segments = transcript_json.get("segments")
     if not isinstance(segments, list):
@@ -86,7 +93,7 @@ def extract_words_safe(transcript_json):
             continue
         seg_words = seg.get("words")
         if isinstance(seg_words, list) and len(seg_words) > 0:
-            fallback_words.extend(seg_words)
+            fallback_words.extend([w for w in seg_words if isinstance(w, dict)])
         else:
             tokens = str(seg.get("text") or "").strip().split()
             if not tokens:
@@ -105,7 +112,9 @@ def extract_words_safe(transcript_json):
 
 def find_viral_clips_gemini(transcript_json, gemini_key, num_clips=3):
     segments = transcript_json.get("segments") if isinstance(transcript_json, dict) else []
-    segments = segments or []
+    if not isinstance(segments, list):
+        segments = []
+
     formatted_transcript = ""
     for seg in segments:
         if not isinstance(seg, dict):
@@ -116,7 +125,11 @@ def find_viral_clips_gemini(transcript_json, gemini_key, num_clips=3):
         formatted_transcript += f"[{start}s - {end}s] {text}\n"
 
     if not formatted_transcript.strip():
-        raise ValueError("Transkrip audio kosong. Pastikan video YouTube memiliki suara ceramah yang jelas.")
+        raw_text_full = str(transcript_json.get("text") or "").strip()
+        if raw_text_full:
+            formatted_transcript = f"[0.0s - 60.0s] {raw_text_full}\n"
+        else:
+            raise ValueError("Transkrip audio dari Groq kosong.")
 
     prompt = f"""
 Kamu adalah editor ahli konten TikTok dakwah/ceramah ustadz Indonesia.
@@ -149,16 +162,28 @@ Transkrip Ceramah:
     }
     resp = requests.post(url, json=payload, timeout=120)
     if resp.status_code != 200:
-        raise RuntimeError(f"Gemini Error ({resp.status_code}): {resp.text[:250]}")
+        raise RuntimeError(f"Gemini Error ({resp.status_code}): {resp.text[:300]}")
 
-    raw_text = resp.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
+    res_json = resp.json()
+    candidates = res_json.get("candidates") if isinstance(res_json, dict) else None
+    if not candidates or not isinstance(candidates, list):
+        raise RuntimeError(f"Gemini tidak mengembalikan kandidat jawaban: {str(res_json)[:300]}")
+
+    content = candidates[0].get("content") or {}
+    parts = content.get("parts") or []
+    if not parts:
+        raise RuntimeError("Gemini mengembalikan parts kosong.")
+
+    raw_text = str(parts[0].get("text") or "").strip()
     if raw_text.startswith("```"):
         raw_text = raw_text.split("\n", 1)[1]
     if raw_text.endswith("```"):
         raw_text = raw_text.rsplit("\n", 1)[0]
 
     parsed = json.loads(raw_text.strip())
-    return parsed if isinstance(parsed, list) else []
+    if not isinstance(parsed, list):
+        raise ValueError("Gemini tidak mengembalikan daftar klip yang valid.")
+    return [c for c in parsed if isinstance(c, dict)]
 
 
 def format_ass_time(seconds):
@@ -172,8 +197,9 @@ def format_ass_time(seconds):
 
 
 def create_ass_subtitle(words, start_clip, end_clip, title, ass_path):
+    safe_words = words if isinstance(words, list) else []
     clip_words = []
-    for w in (words or []):
+    for w in safe_words:
         if not isinstance(w, dict):
             continue
         w_start = float(w.get("start") or 0)
@@ -248,7 +274,9 @@ def render_clip(video_path, ass_path, start_time, end_time, output_path):
         "-b:a", "128k",
         output_path
     ]
-    subprocess.run(cmd, check=True)
+    res = subprocess.run(cmd, capture_output=True, text=True)
+    if res.returncode != 0:
+        raise RuntimeError(f"FFmpeg render error: {res.stderr[-300:]}")
 
 
 @app.route("/")
@@ -260,17 +288,17 @@ def index():
 @app.route("/api/generate", methods=["POST"])
 def generate():
     data = request.get_json(silent=True) or {}
-    app_pass = os.environ.get("APP_PASSWORD", "")
+    app_pass = (os.environ.get("APP_PASSWORD") or "").strip()
     if app_pass and str(data.get("password") or "").strip() != app_pass:
         return jsonify({"error": "Password akses salah!"}), 401
 
     yt_url = str(data.get("url") or "").strip()
-    groq_key = str(data.get("groq_key") or "").strip() or os.environ.get("GROQ_API_KEY", "")
-    gemini_key = str(data.get("gemini_key") or "").strip() or os.environ.get("GEMINI_API_KEY", "")
+    groq_key = str(data.get("groq_key") or "").strip() or (os.environ.get("GROQ_API_KEY") or "").strip()
+    gemini_key = str(data.get("gemini_key") or "").strip() or (os.environ.get("GEMINI_API_KEY") or "").strip()
     num_clips = int(data.get("num_clips") or 3)
 
     if not yt_url or not groq_key or not gemini_key:
-        return jsonify({"error": "Link YouTube dan API Key wajib terisi!"}), 400
+        return jsonify({"error": "Link YouTube, GROQ_API_KEY, dan GEMINI_API_KEY wajib terisi!"}), 400
 
     job_id = str(uuid.uuid4())[:8]
 
@@ -306,8 +334,9 @@ def generate():
         return jsonify({"status": "success", "clips": results})
 
     except Exception as e:
-        tb = traceback.format_exc().splitlines()[-3:]
-        return jsonify({"error": f"{str(e)} | Lokasi: {' -> '.join(tb)}"}), 500
+        tb_lines = traceback.format_exc().strip().splitlines()
+        detail = " | ".join(tb_lines[-3:])
+        return jsonify({"error": f"{str(e)} || DETAIL: {detail}"}), 500
 
 
 if __name__ == "__main__":
