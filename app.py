@@ -1,4 +1,5 @@
 import os
+import re
 import json
 import uuid
 import shutil
@@ -18,6 +19,99 @@ os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 os.makedirs(CLIPS_DIR, exist_ok=True)
 
 
+def extract_video_id(yt_url):
+    patterns = [
+        r"(?:v=|\/)([0-9A-Za-z_-]{11}).*",
+        r"(?:youtu\.be\/)([0-9A-Za-z_-]{11})",
+        r"(?:shorts\/)([0-9A-Za-z_-]{11})"
+    ]
+    for pat in patterns:
+        m = re.search(pat, yt_url)
+        if m:
+            return m.group(1)
+    return ""
+
+
+def find_mp4_url_recursive(obj):
+    if isinstance(obj, dict):
+        # Prioritaskan link yang mengandung mp4 atau format video dengan audio
+        url_val = obj.get("url") or obj.get("link") or obj.get("downloadUrl")
+        mime = str(obj.get("mimeType") or obj.get("ext") or obj.get("format") or "").lower()
+        has_audio = obj.get("hasAudio", True)
+        if isinstance(url_val, str) and url_val.startswith("http"):
+            if ("mp4" in mime or "googlevideo.com" in url_val) and has_audio is not False:
+                return url_val
+        for v in obj.values():
+            found = find_mp4_url_recursive(v)
+            if found:
+                return found
+    elif isinstance(obj, list):
+        # Urutkan agar kualitas 720p/480p/360p (yang sudah gabung audio) diprioritaskan
+        for item in obj:
+            if isinstance(item, dict):
+                q = str(item.get("qualityLabel") or item.get("quality") or "")
+                u = item.get("url") or item.get("link")
+                mime = str(item.get("mimeType") or item.get("ext") or "").lower()
+                if isinstance(u, str) and u.startswith("http") and ("720" in q or "480" in q or "360" in q) and "mp4" in mime:
+                    return u
+        for item in obj:
+            found = find_mp4_url_recursive(item)
+            if found:
+                return found
+    return ""
+
+
+def download_via_rapidapi(yt_url, video_path):
+    rapid_key = (os.environ.get("RAPIDAPI_KEY") or "").strip()
+    rapid_host = (os.environ.get("RAPIDAPI_HOST") or "").strip()
+    rapid_endpoint = (os.environ.get("RAPIDAPI_ENDPOINT") or "").strip()
+
+    if not rapid_key or not rapid_host or not rapid_endpoint:
+        return False, "RAPIDAPI_KEY / HOST / ENDPOINT belum diatur."
+
+    vid_id = extract_video_id(yt_url)
+    headers = {
+        "x-rapidapi-key": rapid_key,
+        "x-rapidapi-host": rapid_host
+    }
+
+    # Coba beberapa pola query parameter umum pada RapidAPI YouTube Downloader
+    param_variants = [
+        {"id": vid_id} if vid_id else {"url": yt_url},
+        {"url": yt_url},
+        {"videoId": vid_id} if vid_id else {"url": yt_url}
+    ]
+
+    last_err = ""
+    for params in param_variants:
+        try:
+            resp = requests.get(rapid_endpoint, headers=headers, params=params, timeout=30)
+            if resp.status_code != 200:
+                last_err = f"HTTP {resp.status_code}: {resp.text[:150]}"
+                continue
+
+            data = resp.json()
+            dl_url = find_mp4_url_recursive(data)
+            if not dl_url:
+                last_err = f"URL MP4 tidak ditemukan dalam respons RapidAPI: {str(data)[:200]}"
+                continue
+
+            with requests.get(dl_url, stream=True, timeout=240, headers={"User-Agent": "Mozilla/5.0"}) as vid_r:
+                vid_r.raise_for_status()
+                with open(video_path, "wb") as f:
+                    for chunk in vid_r.iter_content(chunk_size=1024 * 256):
+                        if chunk:
+                            f.write(chunk)
+
+            if os.path.exists(video_path) and os.path.getsize(video_path) > 50000:
+                return True, ""
+            last_err = "File video terunduh kosong/terlalu kecil."
+        except Exception as e:
+            last_err = str(e)
+
+    return False, last_err
+
+
 def extract_audio(video_path, audio_path):
     cmd_aud = [
         FFMPEG_BIN, "-y",
@@ -30,52 +124,17 @@ def extract_audio(video_path, audio_path):
         raise RuntimeError(f"FFmpeg audio gagal: {res_aud.stderr[-300:]}")
 
 
-def download_via_cobalt(yt_url, video_path):
-    cobalt_endpoints = [
-        "https://api.cobalt.tools/",
-        "https://cobalt-api.kwiatekmiki.com/",
-        "https://cobalt.canine.tools/"
-    ]
-    headers = {
-        "Accept": "application/json",
-        "Content-Type": "application/json",
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-    }
-    payload = {
-        "url": yt_url,
-        "videoQuality": "720",
-        "filenameStyle": "basic"
-    }
-    for ep in cobalt_endpoints:
-        try:
-            r = requests.post(ep, json=payload, headers=headers, timeout=25)
-            if r.status_code == 200:
-                data = r.json()
-                dl_url = data.get("url")
-                if dl_url:
-                    with requests.get(dl_url, stream=True, timeout=180) as vid_r:
-                        vid_r.raise_for_status()
-                        with open(video_path, "wb") as f:
-                            for chunk in vid_r.iter_content(chunk_size=1024 * 256):
-                                if chunk:
-                                    f.write(chunk)
-                    if os.path.exists(video_path) and os.path.getsize(video_path) > 50000:
-                        return True
-        except Exception:
-            continue
-    return False
-
-
 def download_youtube(url, job_id):
     video_path = os.path.join(DOWNLOAD_DIR, f"{job_id}.mp4")
     audio_path = os.path.join(DOWNLOAD_DIR, f"{job_id}.mp3")
 
-    # Jalur 1: Coba via Cobalt API (melewati blokir IP datacenter YouTube)
-    if download_via_cobalt(url, video_path):
+    # Jalur 1: Gunakan RapidAPI (Gratis & bebas blokir IP Railway)
+    ok_rapid, rapid_err = download_via_rapidapi(url, video_path)
+    if ok_rapid:
         extract_audio(video_path, audio_path)
         return video_path, audio_path
 
-    # Jalur 2: Fallback ke yt-dlp dengan cookies + player_client
+    # Jalur 2: Fallback ke yt-dlp
     cookie_args = []
     yt_cookies = (os.environ.get("YOUTUBE_COOKIES") or "").strip()
     if yt_cookies:
@@ -95,9 +154,8 @@ def download_youtube(url, job_id):
     ]
     res = subprocess.run(cmd_vid, capture_output=True, text=True)
     if res.returncode != 0 or not os.path.exists(video_path):
-        err_tail = " | ".join(res.stderr.strip().splitlines()[-2:])
         raise RuntimeError(
-            f"Server Railway diblokir YouTube ({err_tail}). Gunakan fitur 'Upload Video MP4 Langsung' di sebelah kanan!"
+            f"Gagal unduh YouTube. RapidAPI: ({rapid_err}) | yt-dlp juga diblokir IP datacenter."
         )
 
     extract_audio(video_path, audio_path)
