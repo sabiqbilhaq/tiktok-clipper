@@ -1,5 +1,6 @@
 import os
 import re
+import time
 import json
 import uuid
 import shutil
@@ -38,8 +39,7 @@ def collect_candidate_urls(obj, found=None):
         if obj.startswith("http") and "youtube.com" not in obj and "youtu.be" not in obj:
             found.append(obj)
     elif isinstance(obj, dict):
-        # Prioritaskan key yang menandakan link download
-        priority_keys = ["download_url", "downloadUrl", "dlink", "mp4", "link", "url", "file"]
+        priority_keys = ["download_url", "downloadUrl", "dlink", "mp4", "link", "url", "file", "result"]
         for k in priority_keys:
             if k in obj:
                 collect_candidate_urls(obj[k], found)
@@ -61,44 +61,51 @@ def download_via_rapidapi(yt_url, video_path):
         return False, "RAPIDAPI_KEY, RAPIDAPI_HOST, dan RAPIDAPI_ENDPOINT belum diisi di Railway."
 
     vid_id = extract_video_id(yt_url)
+    if not vid_id:
+        return False, "ID video YouTube tidak valid."
+
     headers = {
+        "Content-Type": "application/json",
         "x-rapidapi-key": rapid_key,
         "x-rapidapi-host": rapid_host
     }
 
-    payload_variants = [
-        ("GET", {"url": yt_url}),
-        ("GET", {"id": vid_id} if vid_id else {"url": yt_url}),
-        ("GET", {"videoId": vid_id, "quality": "720"} if vid_id else {"url": yt_url}),
-        ("POST", {"url": yt_url})
+    opachi_payloads = [
+        {"id": vid_id, "type": "mp4", "quality": "720p"},
+        {"id": vid_id, "type": "mp4", "quality": "480p"},
+        {"id": vid_id}
     ]
 
     last_err = ""
-    for method, params in payload_variants:
+    for body in opachi_payloads:
         try:
-            if method == "GET":
-                resp = requests.get(rapid_endpoint, headers=headers, params=params, timeout=45)
-            else:
-                resp = requests.post(rapid_endpoint, headers=headers, json=params, timeout=45)
+            data = None
+            candidates = []
+            for _ in range(6):
+                resp = requests.post(rapid_endpoint, headers=headers, json=body, timeout=45)
+                if resp.status_code != 200:
+                    last_err = f"HTTP {resp.status_code}: {resp.text[:200]}"
+                    break
 
-            if resp.status_code != 200:
-                last_err = f"HTTP {resp.status_code}: {resp.text[:150]}"
-                continue
+                data = resp.json()
+                candidates = collect_candidate_urls(data)
+                if candidates:
+                    break
 
-            data = resp.json()
-            candidates = collect_candidate_urls(data)
+                status_txt = str(data.get("status") or data.get("state") or "").lower()
+                if any(w in status_txt for w in ["process", "queue", "pend", "wait", "convert"]):
+                    time.sleep(4)
+                    continue
+                else:
+                    last_err = f"Respons API belum berisi link download: {str(data)[:220]}"
+                    break
+
             if not candidates:
-                last_err = f"Tidak ada URL download di respons API: {str(data)[:220]}"
                 continue
 
-            # Urutkan: utamakan URL non-googlevideo (proxy server) dulu, baru googlevideo dengan ipbypass=yes
             non_gv = [u for u in candidates if "googlevideo.com" not in u]
             gv_bypass = [u for u in candidates if "googlevideo.com" in u and "ipbypass=yes" in u]
-            ordered_urls = non_gv + gv_bypass
-
-            if not ordered_urls:
-                last_err = "API hanya mengembalikan link googlevideo.com yang dikunci IP. Gunakan API converter RapidAPI yang memberikan link download server/CDN."
-                continue
+            ordered_urls = non_gv + gv_bypass if (non_gv or gv_bypass) else candidates
 
             for dl_url in ordered_urls[:5]:
                 try:
@@ -256,7 +263,7 @@ Kamu adalah editor ahli konten TikTok dakwah/ceramah ustadz Indonesia.
 Analisislah transkrip ceramah berikut beserta timestamp detiknya, lalu pilih {num_clips} potongan (klip) terbaik yang paling menyentuh hati, punya hook kuat di awal, bermakna utuh, dan berpotensi FYP/viral di TikTok.
 
 Aturan ketat:
-1. Durasi setiap klip WAJIB antara 25 detik hingga 75 detik.
+1. Durasi setiap klip WAJIB antara 60 detik hingga 90 detik.
 2. Titik mulai (start_time) dan selesai (end_time) harus pas di awal kalimat dan akhir kalimat yang utuh.
 3. Berikan judul hook singkat (maksimal 6 kata) yang menarik perhatian untuk dipasang di bagian atas video.
 4. Kembalikan HANYA format JSON valid berupa array objek tanpa markdown ```json atau teks tambahan apa pun.
@@ -266,7 +273,7 @@ Format JSON wajib:
   {{
     "title": "Judul Hook Singkat",
     "start_time": 120.5,
-    "end_time": 175.0,
+    "end_time": 195.0,
     "reason": "Alasan singkat kenapa bagian ini menarik"
   }}
 ]
