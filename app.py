@@ -1,3 +1,4 @@
+import traceback
 import os
 import json
 import uuid
@@ -305,7 +306,8 @@ def generate():
         return jsonify({"status": "success", "clips": results})
 
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        tb = traceback.format_exc().splitlines()[-3:]
+        return jsonify({"error": f"{str(e)} | Lokasi: {' -> '.join(tb)}"}), 500
 
 
 if __name__ == "__main__":
