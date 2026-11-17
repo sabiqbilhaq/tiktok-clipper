@@ -34,7 +34,6 @@ def extract_video_id(yt_url):
 
 def find_mp4_url_recursive(obj):
     if isinstance(obj, dict):
-        # Prioritaskan link yang mengandung mp4 atau format video dengan audio
         url_val = obj.get("url") or obj.get("link") or obj.get("downloadUrl")
         mime = str(obj.get("mimeType") or obj.get("ext") or obj.get("format") or "").lower()
         has_audio = obj.get("hasAudio", True)
@@ -46,7 +45,6 @@ def find_mp4_url_recursive(obj):
             if found:
                 return found
     elif isinstance(obj, list):
-        # Urutkan agar kualitas 720p/480p/360p (yang sudah gabung audio) diprioritaskan
         for item in obj:
             if isinstance(item, dict):
                 q = str(item.get("qualityLabel") or item.get("quality") or "")
@@ -75,7 +73,6 @@ def download_via_rapidapi(yt_url, video_path):
         "x-rapidapi-host": rapid_host
     }
 
-    # Coba beberapa pola query parameter umum pada RapidAPI YouTube Downloader
     param_variants = [
         {"id": vid_id} if vid_id else {"url": yt_url},
         {"url": yt_url},
@@ -128,13 +125,11 @@ def download_youtube(url, job_id):
     video_path = os.path.join(DOWNLOAD_DIR, f"{job_id}.mp4")
     audio_path = os.path.join(DOWNLOAD_DIR, f"{job_id}.mp3")
 
-    # Jalur 1: Gunakan RapidAPI (Gratis & bebas blokir IP Railway)
     ok_rapid, rapid_err = download_via_rapidapi(url, video_path)
     if ok_rapid:
         extract_audio(video_path, audio_path)
         return video_path, audio_path
 
-    # Jalur 2: Fallback ke yt-dlp
     cookie_args = []
     yt_cookies = (os.environ.get("YOUTUBE_COOKIES") or "").strip()
     if yt_cookies:
@@ -163,7 +158,7 @@ def download_youtube(url, job_id):
 
 
 def transcribe_groq(audio_path, groq_key):
-    url = "https://api.groq.com/openai/v1/audio/transcriptions"
+    base_groq = "https://api.groq.com/openai/v1/audio/transcriptions"
     headers = {"Authorization": f"Bearer {groq_key}"}
     with open(audio_path, "rb") as f:
         files = {"file": (os.path.basename(audio_path), f, "audio/mpeg")}
@@ -172,7 +167,7 @@ def transcribe_groq(audio_path, groq_key):
             "language": "id",
             "response_format": "verbose_json"
         }
-        resp = requests.post(url, headers=headers, files=files, data=data, timeout=300)
+        resp = requests.post(base_groq, headers=headers, files=files, data=data, timeout=300)
         if resp.status_code != 200:
             raise RuntimeError(f"Groq Error ({resp.status_code}): {resp.text[:300]}")
         parsed = resp.json()
@@ -261,12 +256,15 @@ Transkrip Ceramah:
 {formatted_transcript[:28000]}
 """
 
-    url = f"[https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=](https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=){gemini_key}"
+    gemini_host = "generativelanguage.googleapis.com"
+    gemini_path = "/v1beta/models/gemini-2.5-flash:generateContent"
+    endpoint_url = "https://" + gemini_host + gemini_path + "?key=" + gemini_key
+
     payload = {
         "contents": [{"parts": [{"text": prompt}]}],
         "generationConfig": {"temperature": 0.4}
     }
-    resp = requests.post(url, json=payload, timeout=120)
+    resp = requests.post(endpoint_url, json=payload, timeout=120)
     if resp.status_code != 200:
         raise RuntimeError(f"Gemini Error ({resp.status_code}): {resp.text[:300]}")
 
