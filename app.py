@@ -29,21 +29,36 @@ def download_youtube(url, job_id):
             cf.write(yt_cookies + "\n")
         cookie_args = ["--cookies", cookie_path]
 
-   cmd_vid = [
-        "yt-dlp",
-        *cookie_args,
-        "--no-playlist",
-        "--extractor-args", "youtube:player_client=tv_embedded,web",
-        "--user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-        "-f", "bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/best[height<=720][ext=mp4]/best",
-        "--merge-output-format", "mp4",
-        "-o", video_path,
-        url
+    # Coba beberapa profil klien YouTube yang lolos dari IP datacenter tanpa JS runtime
+    client_profiles = [
+        ["--extractor-args", "youtube:player_client=ios,mweb"],
+        ["--extractor-args", "youtube:player_client=android_vr"],
+        [*cookie_args, "--extractor-args", "youtube:player_client=tv_embedded,mweb"]
     ]
-    res = subprocess.run(cmd_vid, capture_output=True, text=True)
-    if res.returncode != 0:
-        err_tail = " | ".join(res.stderr.strip().splitlines()[-3:])
-        raise RuntimeError(f"yt-dlp gagal: {err_tail}")
+
+    last_err = ""
+    downloaded = False
+    for extra_args in client_profiles:
+        if os.path.exists(video_path):
+            os.remove(video_path)
+        cmd_vid = [
+            "yt-dlp",
+            *extra_args,
+            "--no-playlist",
+            "--no-check-certificates",
+            "-f", "bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/best[height<=720][ext=mp4]/best",
+            "--merge-output-format", "mp4",
+            "-o", video_path,
+            url
+        ]
+        res = subprocess.run(cmd_vid, capture_output=True, text=True)
+        if res.returncode == 0 and os.path.exists(video_path):
+            downloaded = True
+            break
+        last_err = " | ".join(res.stderr.strip().splitlines()[-3:])
+
+    if not downloaded:
+        raise RuntimeError(f"yt-dlp gagal: {last_err}")
 
     cmd_aud = [
         FFMPEG_BIN, "-y",
