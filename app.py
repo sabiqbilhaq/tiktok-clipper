@@ -8,6 +8,7 @@ import requests
 from flask import Flask, render_template, request, jsonify
 
 app = Flask(__name__)
+app.config["MAX_CONTENT_LENGTH"] = 500 * 1024 * 1024  # Maksimal upload 500MB
 
 FFMPEG_BIN = shutil.which("ffmpeg") or os.path.abspath("bin/ffmpeg")
 DOWNLOAD_DIR = os.path.abspath("downloads")
@@ -17,49 +18,7 @@ os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 os.makedirs(CLIPS_DIR, exist_ok=True)
 
 
-def download_youtube(url, job_id):
-    video_path = os.path.join(DOWNLOAD_DIR, f"{job_id}.mp4")
-    audio_path = os.path.join(DOWNLOAD_DIR, f"{job_id}.mp3")
-
-    cookie_args = []
-    yt_cookies = (os.environ.get("YOUTUBE_COOKIES") or "").strip()
-    if yt_cookies:
-        cookie_path = os.path.join(DOWNLOAD_DIR, "cookies.txt")
-        with open(cookie_path, "w", encoding="utf-8") as cf:
-            cf.write(yt_cookies + "\n")
-        cookie_args = ["--cookies", cookie_path]
-
-    # Coba beberapa profil klien YouTube yang lolos dari IP datacenter tanpa JS runtime
-    client_profiles = [
-        ["--extractor-args", "youtube:player_client=ios,mweb"],
-        ["--extractor-args", "youtube:player_client=android_vr"],
-        [*cookie_args, "--extractor-args", "youtube:player_client=tv_embedded,mweb"]
-    ]
-
-    last_err = ""
-    downloaded = False
-    for extra_args in client_profiles:
-        if os.path.exists(video_path):
-            os.remove(video_path)
-        cmd_vid = [
-            "yt-dlp",
-            *extra_args,
-            "--no-playlist",
-            "--no-check-certificates",
-            "-f", "bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/best[height<=720][ext=mp4]/best",
-            "--merge-output-format", "mp4",
-            "-o", video_path,
-            url
-        ]
-        res = subprocess.run(cmd_vid, capture_output=True, text=True)
-        if res.returncode == 0 and os.path.exists(video_path):
-            downloaded = True
-            break
-        last_err = " | ".join(res.stderr.strip().splitlines()[-3:])
-
-    if not downloaded:
-        raise RuntimeError(f"yt-dlp gagal: {last_err}")
-
+def extract_audio(video_path, audio_path):
     cmd_aud = [
         FFMPEG_BIN, "-y",
         "-i", video_path,
@@ -70,6 +29,78 @@ def download_youtube(url, job_id):
     if res_aud.returncode != 0:
         raise RuntimeError(f"FFmpeg audio gagal: {res_aud.stderr[-300:]}")
 
+
+def download_via_cobalt(yt_url, video_path):
+    cobalt_endpoints = [
+        "https://api.cobalt.tools/",
+        "https://cobalt-api.kwiatekmiki.com/",
+        "https://cobalt.canine.tools/"
+    ]
+    headers = {
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+    }
+    payload = {
+        "url": yt_url,
+        "videoQuality": "720",
+        "filenameStyle": "basic"
+    }
+    for ep in cobalt_endpoints:
+        try:
+            r = requests.post(ep, json=payload, headers=headers, timeout=25)
+            if r.status_code == 200:
+                data = r.json()
+                dl_url = data.get("url")
+                if dl_url:
+                    with requests.get(dl_url, stream=True, timeout=180) as vid_r:
+                        vid_r.raise_for_status()
+                        with open(video_path, "wb") as f:
+                            for chunk in vid_r.iter_content(chunk_size=1024 * 256):
+                                if chunk:
+                                    f.write(chunk)
+                    if os.path.exists(video_path) and os.path.getsize(video_path) > 50000:
+                        return True
+        except Exception:
+            continue
+    return False
+
+
+def download_youtube(url, job_id):
+    video_path = os.path.join(DOWNLOAD_DIR, f"{job_id}.mp4")
+    audio_path = os.path.join(DOWNLOAD_DIR, f"{job_id}.mp3")
+
+    # Jalur 1: Coba via Cobalt API (melewati blokir IP datacenter YouTube)
+    if download_via_cobalt(url, video_path):
+        extract_audio(video_path, audio_path)
+        return video_path, audio_path
+
+    # Jalur 2: Fallback ke yt-dlp dengan cookies + player_client
+    cookie_args = []
+    yt_cookies = (os.environ.get("YOUTUBE_COOKIES") or "").strip()
+    if yt_cookies:
+        cookie_path = os.path.join(DOWNLOAD_DIR, "cookies.txt")
+        with open(cookie_path, "w", encoding="utf-8") as cf:
+            cf.write(yt_cookies + "\n")
+        cookie_args = ["--cookies", cookie_path]
+
+    cmd_vid = [
+        "yt-dlp",
+        *cookie_args,
+        "--no-playlist",
+        "--extractor-args", "youtube:player_client=tv_embedded,android_vr",
+        "-f", "best[height<=720][ext=mp4]/best[ext=mp4]/best",
+        "-o", video_path,
+        url
+    ]
+    res = subprocess.run(cmd_vid, capture_output=True, text=True)
+    if res.returncode != 0 or not os.path.exists(video_path):
+        err_tail = " | ".join(res.stderr.strip().splitlines()[-2:])
+        raise RuntimeError(
+            f"Server Railway diblokir YouTube ({err_tail}). Gunakan fitur 'Upload Video MP4 Langsung' di sebelah kanan!"
+        )
+
+    extract_audio(video_path, audio_path)
     return video_path, audio_path
 
 
@@ -304,23 +335,44 @@ def index():
 
 @app.route("/api/generate", methods=["POST"])
 def generate():
-    data = request.get_json(silent=True) or {}
+    if request.content_type and "multipart/form-data" in request.content_type:
+        form = request.form
+        password = str(form.get("password") or "").strip()
+        yt_url = str(form.get("url") or "").strip()
+        groq_key = str(form.get("groq_key") or "").strip() or (os.environ.get("GROQ_API_KEY") or "").strip()
+        gemini_key = str(form.get("gemini_key") or "").strip() or (os.environ.get("GEMINI_API_KEY") or "").strip()
+        num_clips = int(form.get("num_clips") or 3)
+        uploaded_file = request.files.get("video_file")
+    else:
+        data = request.get_json(silent=True) or {}
+        password = str(data.get("password") or "").strip()
+        yt_url = str(data.get("url") or "").strip()
+        groq_key = str(data.get("groq_key") or "").strip() or (os.environ.get("GROQ_API_KEY") or "").strip()
+        gemini_key = str(data.get("gemini_key") or "").strip() or (os.environ.get("GEMINI_API_KEY") or "").strip()
+        num_clips = int(data.get("num_clips") or 3)
+        uploaded_file = None
+
     app_pass = (os.environ.get("APP_PASSWORD") or "").strip()
-    if app_pass and str(data.get("password") or "").strip() != app_pass:
+    if app_pass and password != app_pass:
         return jsonify({"error": "Password akses salah!"}), 401
 
-    yt_url = str(data.get("url") or "").strip()
-    groq_key = str(data.get("groq_key") or "").strip() or (os.environ.get("GROQ_API_KEY") or "").strip()
-    gemini_key = str(data.get("gemini_key") or "").strip() or (os.environ.get("GEMINI_API_KEY") or "").strip()
-    num_clips = int(data.get("num_clips") or 3)
+    if not groq_key or not gemini_key:
+        return jsonify({"error": "GROQ_API_KEY dan GEMINI_API_KEY wajib terisi!"}), 400
 
-    if not yt_url or not groq_key or not gemini_key:
-        return jsonify({"error": "Link YouTube, GROQ_API_KEY, dan GEMINI_API_KEY wajib terisi!"}), 400
+    if not yt_url and (not uploaded_file or not uploaded_file.filename):
+        return jsonify({"error": "Masukkan Link YouTube ATAU pilih file video MP4!"}), 400
 
     job_id = str(uuid.uuid4())[:8]
 
     try:
-        video_path, audio_path = download_youtube(yt_url, job_id)
+        if uploaded_file and uploaded_file.filename:
+            video_path = os.path.join(DOWNLOAD_DIR, f"{job_id}.mp4")
+            audio_path = os.path.join(DOWNLOAD_DIR, f"{job_id}.mp3")
+            uploaded_file.save(video_path)
+            extract_audio(video_path, audio_path)
+        else:
+            video_path, audio_path = download_youtube(yt_url, job_id)
+
         transcript = transcribe_groq(audio_path, groq_key)
         words = extract_words_safe(transcript)
         clips_meta = find_viral_clips_gemini(transcript, gemini_key, num_clips)
