@@ -70,10 +70,11 @@ def download_via_rapidapi(yt_url, video_path):
         "x-rapidapi-host": rapid_host
     }
 
+    # Format body resmi Opachi: type wajib "merged" (video + audio tergabung)
     opachi_payloads = [
-        {"id": vid_id, "type": "mp4", "quality": "720p"},
-        {"id": vid_id, "type": "mp4", "quality": "480p"},
-        {"id": vid_id}
+        {"id": vid_id, "type": "merged", "quality": "720p"},
+        {"id": vid_id, "type": "merged", "quality": "480p"},
+        {"id": vid_id, "type": "merged"}
     ]
 
     last_err = ""
@@ -81,9 +82,9 @@ def download_via_rapidapi(yt_url, video_path):
         try:
             data = None
             candidates = []
-            for _ in range(6):
+            for _ in range(10):
                 resp = requests.post(rapid_endpoint, headers=headers, json=body, timeout=45)
-                if resp.status_code != 200:
+                if resp.status_code not in (200, 201, 202):
                     last_err = f"HTTP {resp.status_code}: {resp.text[:200]}"
                     break
 
@@ -92,8 +93,8 @@ def download_via_rapidapi(yt_url, video_path):
                 if candidates:
                     break
 
-                status_txt = str(data.get("status") or data.get("state") or "").lower()
-                if any(w in status_txt for w in ["process", "queue", "pend", "wait", "convert"]):
+                status_txt = str(data.get("status") or data.get("state") or data.get("message") or "").lower()
+                if any(w in status_txt for w in ["process", "queue", "pend", "wait", "convert", "start", "progress"]):
                     time.sleep(4)
                     continue
                 else:
