@@ -2,7 +2,6 @@ import os
 import json
 import uuid
 import shutil
-import traceback
 import subprocess
 import requests
 from flask import Flask, render_template, request, jsonify
@@ -17,26 +16,21 @@ os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 os.makedirs(CLIPS_DIR, exist_ok=True)
 
 
-def prepare_media(yt_url, uploaded_file, job_id):
+def download_youtube(url, job_id):
     video_path = os.path.join(DOWNLOAD_DIR, f"{job_id}.mp4")
     audio_path = os.path.join(DOWNLOAD_DIR, f"{job_id}.mp3")
 
-    if uploaded_file and uploaded_file.filename:
-        uploaded_file.save(video_path)
-    else:
-        cmd_vid = [
-            "yt-dlp",
-            "--no-playlist",
-            "--extractor-args", "youtube:player_client=tv_embedded,android,web",
-            "-f", "bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/best[height<=720][ext=mp4]/best",
-            "--merge-output-format", "mp4",
-            "-o", video_path,
-            yt_url
-        ]
-        res = subprocess.run(cmd_vid, capture_output=True, text=True)
-        if res.returncode != 0:
-            err_msg = res.stderr.strip().splitlines()[-3:]
-            raise RuntimeError(f"YouTube memblokir IP server ({' | '.join(err_msg)}). Solusi: Gunakan opsi Upload Video MP4 di bawahnya!")
+    cmd_vid = [
+        "yt-dlp",
+        "--no-playlist",
+        "-f", "bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/best[height<=720][ext=mp4]/best",
+        "--merge-output-format", "mp4",
+        "-o", video_path,
+        url
+    ]
+    res = subprocess.run(cmd_vid, capture_output=True, text=True)
+    if res.returncode != 0:
+        raise RuntimeError(f"Gagal unduh YouTube: {res.stderr.strip().splitlines()[-1]}")
 
     cmd_aud = [
         FFMPEG_BIN, "-y",
@@ -44,10 +38,7 @@ def prepare_media(yt_url, uploaded_file, job_id):
         "-vn", "-ac", "1", "-ar", "16000", "-b:a", "48k",
         audio_path
     ]
-    res_aud = subprocess.run(cmd_aud, capture_output=True, text=True)
-    if res_aud.returncode != 0:
-        raise RuntimeError(f"Gagal ekstrak audio: {res_aud.stderr[-300:]}")
-
+    subprocess.run(cmd_aud, check=True)
     return video_path, audio_path
 
 
@@ -63,7 +54,7 @@ def transcribe_groq(audio_path, groq_key):
         }
         resp = requests.post(url, headers=headers, files=files, data=data, timeout=300)
         if resp.status_code != 200:
-            raise RuntimeError(f"Groq API Error ({resp.status_code}): {resp.text[:300]}")
+            raise RuntimeError(f"Groq Error ({resp.status_code}): {resp.text[:250]}")
         return resp.json()
 
 
@@ -71,9 +62,9 @@ def extract_words_safe(transcript_json):
     if not isinstance(transcript_json, dict):
         return []
 
-    words = transcript_json.get("words")
-    if isinstance(words, list) and len(words) > 0:
-        return words
+    raw_words = transcript_json.get("words")
+    if isinstance(raw_words, list) and len(raw_words) > 0:
+        return raw_words
 
     segments = transcript_json.get("segments")
     if not isinstance(segments, list):
@@ -87,11 +78,11 @@ def extract_words_safe(transcript_json):
         if isinstance(seg_words, list) and len(seg_words) > 0:
             fallback_words.extend(seg_words)
         else:
-            tokens = str(seg.get("text", "")).strip().split()
+            tokens = str(seg.get("text") or "").strip().split()
             if not tokens:
                 continue
-            s_start = float(seg.get("start", 0))
-            s_end = float(seg.get("end", s_start + 1))
+            s_start = float(seg.get("start") or 0)
+            s_end = float(seg.get("end") or (s_start + 1))
             step = max(0.05, (s_end - s_start) / len(tokens))
             for i, tok in enumerate(tokens):
                 fallback_words.append({
@@ -109,13 +100,13 @@ def find_viral_clips_gemini(transcript_json, gemini_key, num_clips=3):
     for seg in segments:
         if not isinstance(seg, dict):
             continue
-        start = round(float(seg.get("start", 0)), 1)
-        end = round(float(seg.get("end", 0)), 1)
-        text = str(seg.get("text", "")).strip()
+        start = round(float(seg.get("start") or 0), 1)
+        end = round(float(seg.get("end") or 0), 1)
+        text = str(seg.get("text") or "").strip()
         formatted_transcript += f"[{start}s - {end}s] {text}\n"
 
     if not formatted_transcript.strip():
-        raise ValueError("Transkrip audio kosong. Pastikan video memiliki suara ceramah yang jelas.")
+        raise ValueError("Transkrip audio kosong. Pastikan video YouTube memiliki suara ceramah yang jelas.")
 
     prompt = f"""
 Kamu adalah editor ahli konten TikTok dakwah/ceramah ustadz Indonesia.
@@ -148,20 +139,16 @@ Transkrip Ceramah:
     }
     resp = requests.post(url, json=payload, timeout=120)
     if resp.status_code != 200:
-        raise RuntimeError(f"Gemini API Error ({resp.status_code}): {resp.text[:300]}")
+        raise RuntimeError(f"Gemini Error ({resp.status_code}): {resp.text[:250]}")
 
-    res_json = resp.json()
-    raw_text = res_json["candidates"][0]["content"]["parts"][0]["text"].strip()
-
+    raw_text = resp.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
     if raw_text.startswith("```"):
         raw_text = raw_text.split("\n", 1)[1]
     if raw_text.endswith("```"):
         raw_text = raw_text.rsplit("\n", 1)[0]
 
     parsed = json.loads(raw_text.strip())
-    if not isinstance(parsed, list):
-        raise ValueError("Gemini tidak mengembalikan daftar klip yang valid.")
-    return parsed
+    return parsed if isinstance(parsed, list) else []
 
 
 def format_ass_time(seconds):
@@ -179,11 +166,11 @@ def create_ass_subtitle(words, start_clip, end_clip, title, ass_path):
     for w in (words or []):
         if not isinstance(w, dict):
             continue
-        w_start = float(w.get("start", 0))
-        w_end = float(w.get("end", 0))
+        w_start = float(w.get("start") or 0)
+        w_end = float(w.get("end") or 0)
         if w_end >= start_clip and w_start <= end_clip:
             clip_words.append({
-                "word": str(w.get("word", "")).strip(),
+                "word": str(w.get("word") or "").strip(),
                 "start": max(0.0, w_start - start_clip),
                 "end": max(0.1, w_end - start_clip)
             })
@@ -251,9 +238,7 @@ def render_clip(video_path, ass_path, start_time, end_time, output_path):
         "-b:a", "128k",
         output_path
     ]
-    res = subprocess.run(cmd, capture_output=True, text=True)
-    if res.returncode != 0:
-        raise RuntimeError(f"FFmpeg render error: {res.stderr[-300:]}")
+    subprocess.run(cmd, check=True)
 
 
 @app.route("/")
@@ -264,24 +249,23 @@ def index():
 
 @app.route("/api/generate", methods=["POST"])
 def generate():
+    data = request.get_json(silent=True) or {}
     app_pass = os.environ.get("APP_PASSWORD", "")
-    password = request.form.get("password", "").strip()
-    if app_pass and password != app_pass:
+    if app_pass and str(data.get("password") or "").strip() != app_pass:
         return jsonify({"error": "Password akses salah!"}), 401
 
-    yt_url = request.form.get("url", "").strip()
-    uploaded_file = request.files.get("video_file")
-    groq_key = request.form.get("groq_key", "").strip() or os.environ.get("GROQ_API_KEY", "")
-    gemini_key = request.form.get("gemini_key", "").strip() or os.environ.get("GEMINI_API_KEY", "")
-    num_clips = int(request.form.get("num_clips", 3))
+    yt_url = str(data.get("url") or "").strip()
+    groq_key = str(data.get("groq_key") or "").strip() or os.environ.get("GROQ_API_KEY", "")
+    gemini_key = str(data.get("gemini_key") or "").strip() or os.environ.get("GEMINI_API_KEY", "")
+    num_clips = int(data.get("num_clips") or 3)
 
-    if (not yt_url and not (uploaded_file and uploaded_file.filename)) or not groq_key or not gemini_key:
-        return jsonify({"error": "Isi Link YouTube atau pilih file video MP4 terlebih dahulu!"}), 400
+    if not yt_url or not groq_key or not gemini_key:
+        return jsonify({"error": "Link YouTube dan API Key wajib terisi!"}), 400
 
     job_id = str(uuid.uuid4())[:8]
 
     try:
-        video_path, audio_path = prepare_media(yt_url, uploaded_file, job_id)
+        video_path, audio_path = download_youtube(yt_url, job_id)
         transcript = transcribe_groq(audio_path, groq_key)
         words = extract_words_safe(transcript)
         clips_meta = find_viral_clips_gemini(transcript, gemini_key, num_clips)
@@ -290,8 +274,8 @@ def generate():
         for idx, clip in enumerate(clips_meta, start=1):
             start_t = float(clip["start_time"])
             end_t = float(clip["end_time"])
-            title = str(clip.get("title", f"Klip Ceramah #{idx}"))
-            reason = str(clip.get("reason", ""))
+            title = str(clip.get("title") or f"Klip Ceramah #{idx}")
+            reason = str(clip.get("reason") or "")
 
             ass_path = os.path.join(DOWNLOAD_DIR, f"{job_id}_clip{idx}.ass")
             out_filename = f"{job_id}_clip{idx}.mp4"
