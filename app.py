@@ -9,7 +9,6 @@ import requests
 from flask import Flask, render_template, request, jsonify
 
 app = Flask(__name__)
-app.config["MAX_CONTENT_LENGTH"] = 500 * 1024 * 1024  # Maksimal upload 500MB
 
 FFMPEG_BIN = shutil.which("ffmpeg") or os.path.abspath("bin/ffmpeg")
 DOWNLOAD_DIR = os.path.abspath("downloads")
@@ -32,31 +31,25 @@ def extract_video_id(yt_url):
     return ""
 
 
-def find_mp4_url_recursive(obj):
-    if isinstance(obj, dict):
-        url_val = obj.get("url") or obj.get("link") or obj.get("downloadUrl")
-        mime = str(obj.get("mimeType") or obj.get("ext") or obj.get("format") or "").lower()
-        has_audio = obj.get("hasAudio", True)
-        if isinstance(url_val, str) and url_val.startswith("http"):
-            if ("mp4" in mime or "googlevideo.com" in url_val) and has_audio is not False:
-                return url_val
-        for v in obj.values():
-            found = find_mp4_url_recursive(v)
-            if found:
-                return found
+def collect_candidate_urls(obj, found=None):
+    if found is None:
+        found = []
+    if isinstance(obj, str):
+        if obj.startswith("http") and "youtube.com" not in obj and "youtu.be" not in obj:
+            found.append(obj)
+    elif isinstance(obj, dict):
+        # Prioritaskan key yang menandakan link download
+        priority_keys = ["download_url", "downloadUrl", "dlink", "mp4", "link", "url", "file"]
+        for k in priority_keys:
+            if k in obj:
+                collect_candidate_urls(obj[k], found)
+        for k, v in obj.items():
+            if k not in priority_keys:
+                collect_candidate_urls(v, found)
     elif isinstance(obj, list):
         for item in obj:
-            if isinstance(item, dict):
-                q = str(item.get("qualityLabel") or item.get("quality") or "")
-                u = item.get("url") or item.get("link")
-                mime = str(item.get("mimeType") or item.get("ext") or "").lower()
-                if isinstance(u, str) and u.startswith("http") and ("720" in q or "480" in q or "360" in q) and "mp4" in mime:
-                    return u
-        for item in obj:
-            found = find_mp4_url_recursive(item)
-            if found:
-                return found
-    return ""
+            collect_candidate_urls(item, found)
+    return found
 
 
 def download_via_rapidapi(yt_url, video_path):
@@ -65,7 +58,7 @@ def download_via_rapidapi(yt_url, video_path):
     rapid_endpoint = (os.environ.get("RAPIDAPI_ENDPOINT") or "").strip()
 
     if not rapid_key or not rapid_host or not rapid_endpoint:
-        return False, "RAPIDAPI_KEY / HOST / ENDPOINT belum diatur."
+        return False, "RAPIDAPI_KEY, RAPIDAPI_HOST, dan RAPIDAPI_ENDPOINT belum diisi di Railway."
 
     vid_id = extract_video_id(yt_url)
     headers = {
@@ -73,36 +66,60 @@ def download_via_rapidapi(yt_url, video_path):
         "x-rapidapi-host": rapid_host
     }
 
-    param_variants = [
-        {"id": vid_id} if vid_id else {"url": yt_url},
-        {"url": yt_url},
-        {"videoId": vid_id} if vid_id else {"url": yt_url}
+    payload_variants = [
+        ("GET", {"url": yt_url}),
+        ("GET", {"id": vid_id} if vid_id else {"url": yt_url}),
+        ("GET", {"videoId": vid_id, "quality": "720"} if vid_id else {"url": yt_url}),
+        ("POST", {"url": yt_url})
     ]
 
     last_err = ""
-    for params in param_variants:
+    for method, params in payload_variants:
         try:
-            resp = requests.get(rapid_endpoint, headers=headers, params=params, timeout=30)
+            if method == "GET":
+                resp = requests.get(rapid_endpoint, headers=headers, params=params, timeout=45)
+            else:
+                resp = requests.post(rapid_endpoint, headers=headers, json=params, timeout=45)
+
             if resp.status_code != 200:
                 last_err = f"HTTP {resp.status_code}: {resp.text[:150]}"
                 continue
 
             data = resp.json()
-            dl_url = find_mp4_url_recursive(data)
-            if not dl_url:
-                last_err = f"URL MP4 tidak ditemukan dalam respons RapidAPI: {str(data)[:200]}"
+            candidates = collect_candidate_urls(data)
+            if not candidates:
+                last_err = f"Tidak ada URL download di respons API: {str(data)[:220]}"
                 continue
 
-            with requests.get(dl_url, stream=True, timeout=240, headers={"User-Agent": "Mozilla/5.0"}) as vid_r:
-                vid_r.raise_for_status()
-                with open(video_path, "wb") as f:
-                    for chunk in vid_r.iter_content(chunk_size=1024 * 256):
-                        if chunk:
-                            f.write(chunk)
+            # Urutkan: utamakan URL non-googlevideo (proxy server) dulu, baru googlevideo dengan ipbypass=yes
+            non_gv = [u for u in candidates if "googlevideo.com" not in u]
+            gv_bypass = [u for u in candidates if "googlevideo.com" in u and "ipbypass=yes" in u]
+            ordered_urls = non_gv + gv_bypass
 
-            if os.path.exists(video_path) and os.path.getsize(video_path) > 50000:
-                return True, ""
-            last_err = "File video terunduh kosong/terlalu kecil."
+            if not ordered_urls:
+                last_err = "API hanya mengembalikan link googlevideo.com yang dikunci IP. Gunakan API converter RapidAPI yang memberikan link download server/CDN."
+                continue
+
+            for dl_url in ordered_urls[:5]:
+                try:
+                    with requests.get(dl_url, stream=True, timeout=240, headers={"User-Agent": "Mozilla/5.0"}) as vid_r:
+                        if vid_r.status_code != 200:
+                            last_err = f"Gagal unduh file dari CDN ({vid_r.status_code})"
+                            continue
+                        ctype = str(vid_r.headers.get("Content-Type") or "").lower()
+                        if "text/html" in ctype or "application/json" in ctype:
+                            continue
+                        with open(video_path, "wb") as f:
+                            for chunk in vid_r.iter_content(chunk_size=1024 * 256):
+                                if chunk:
+                                    f.write(chunk)
+
+                    if os.path.exists(video_path) and os.path.getsize(video_path) > 100000:
+                        return True, ""
+                except Exception as dl_e:
+                    last_err = str(dl_e)
+                    continue
+
         except Exception as e:
             last_err = str(e)
 
@@ -126,32 +143,8 @@ def download_youtube(url, job_id):
     audio_path = os.path.join(DOWNLOAD_DIR, f"{job_id}.mp3")
 
     ok_rapid, rapid_err = download_via_rapidapi(url, video_path)
-    if ok_rapid:
-        extract_audio(video_path, audio_path)
-        return video_path, audio_path
-
-    cookie_args = []
-    yt_cookies = (os.environ.get("YOUTUBE_COOKIES") or "").strip()
-    if yt_cookies:
-        cookie_path = os.path.join(DOWNLOAD_DIR, "cookies.txt")
-        with open(cookie_path, "w", encoding="utf-8") as cf:
-            cf.write(yt_cookies + "\n")
-        cookie_args = ["--cookies", cookie_path]
-
-    cmd_vid = [
-        "yt-dlp",
-        *cookie_args,
-        "--no-playlist",
-        "--extractor-args", "youtube:player_client=tv_embedded,android_vr",
-        "-f", "best[height<=720][ext=mp4]/best[ext=mp4]/best",
-        "-o", video_path,
-        url
-    ]
-    res = subprocess.run(cmd_vid, capture_output=True, text=True)
-    if res.returncode != 0 or not os.path.exists(video_path):
-        raise RuntimeError(
-            f"Gagal unduh YouTube. RapidAPI: ({rapid_err}) | yt-dlp juga diblokir IP datacenter."
-        )
+    if not ok_rapid:
+        raise RuntimeError(f"Gagal mengambil video dari YouTube: {rapid_err}")
 
     extract_audio(video_path, audio_path)
     return video_path, audio_path
@@ -212,7 +205,6 @@ def extract_words_safe(transcript_json):
 
 
 def get_available_gemini_models(gemini_key):
-    """Ambil daftar model Gemini yang benar-benar aktif untuk API key ini."""
     list_url = f"https://generativelanguage.googleapis.com/v1beta/models?key={gemini_key}"
     try:
         r = requests.get(list_url, timeout=20)
@@ -229,7 +221,6 @@ def get_available_gemini_models(gemini_key):
                         valid_flash.append(short_name)
                     else:
                         valid_others.append(short_name)
-            # Urutkan flash terbaru di depan
             valid_flash.sort(reverse=True)
             combined = valid_flash + valid_others
             if combined:
@@ -427,44 +418,25 @@ def index():
 
 @app.route("/api/generate", methods=["POST"])
 def generate():
-    if request.content_type and "multipart/form-data" in request.content_type:
-        form = request.form
-        password = str(form.get("password") or "").strip()
-        yt_url = str(form.get("url") or "").strip()
-        groq_key = str(form.get("groq_key") or "").strip() or (os.environ.get("GROQ_API_KEY") or "").strip()
-        gemini_key = str(form.get("gemini_key") or "").strip() or (os.environ.get("GEMINI_API_KEY") or "").strip()
-        num_clips = int(form.get("num_clips") or 3)
-        uploaded_file = request.files.get("video_file")
-    else:
-        data = request.get_json(silent=True) or {}
-        password = str(data.get("password") or "").strip()
-        yt_url = str(data.get("url") or "").strip()
-        groq_key = str(data.get("groq_key") or "").strip() or (os.environ.get("GROQ_API_KEY") or "").strip()
-        gemini_key = str(data.get("gemini_key") or "").strip() or (os.environ.get("GEMINI_API_KEY") or "").strip()
-        num_clips = int(data.get("num_clips") or 3)
-        uploaded_file = None
-
+    data = request.get_json(silent=True) or {}
     app_pass = (os.environ.get("APP_PASSWORD") or "").strip()
-    if app_pass and password != app_pass:
+    if app_pass and str(data.get("password") or "").strip() != app_pass:
         return jsonify({"error": "Password akses salah!"}), 401
 
+    yt_url = str(data.get("url") or "").strip()
+    groq_key = str(data.get("groq_key") or "").strip() or (os.environ.get("GROQ_API_KEY") or "").strip()
+    gemini_key = str(data.get("gemini_key") or "").strip() or (os.environ.get("GEMINI_API_KEY") or "").strip()
+    num_clips = int(data.get("num_clips") or 3)
+
+    if not yt_url:
+        return jsonify({"error": "Masukkan Link YouTube terlebih dahulu!"}), 400
     if not groq_key or not gemini_key:
         return jsonify({"error": "GROQ_API_KEY dan GEMINI_API_KEY wajib terisi!"}), 400
-
-    if not yt_url and (not uploaded_file or not uploaded_file.filename):
-        return jsonify({"error": "Masukkan Link YouTube ATAU pilih file video MP4!"}), 400
 
     job_id = str(uuid.uuid4())[:8]
 
     try:
-        if uploaded_file and uploaded_file.filename:
-            video_path = os.path.join(DOWNLOAD_DIR, f"{job_id}.mp4")
-            audio_path = os.path.join(DOWNLOAD_DIR, f"{job_id}.mp3")
-            uploaded_file.save(video_path)
-            extract_audio(video_path, audio_path)
-        else:
-            video_path, audio_path = download_youtube(yt_url, job_id)
-
+        video_path, audio_path = download_youtube(yt_url, job_id)
         transcript = transcribe_groq(audio_path, groq_key)
         words = extract_words_safe(transcript)
         clips_meta = find_viral_clips_gemini(transcript, gemini_key, num_clips)
