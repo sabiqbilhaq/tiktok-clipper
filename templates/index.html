@@ -41,13 +41,13 @@
       text-decoration: none; padding: 10px; border-radius: 8px; font-weight: 600; font-size: 0.9rem;
     }
     .dl-btn:hover { background: #15803d; }
-    .error-box { display: none; background: #7f1d1d; color: #fecaca; padding: 14px; border-radius: 8px; margin-bottom: 20px; }
+    .error-box { display: none; background: #7f1d1d; color: #fecaca; padding: 14px; border-radius: 8px; margin-bottom: 20px; line-height: 1.5; }
   </style>
 </head>
 <body>
   <div class="container">
     <h1>Auto Clipper Ceramah AI</h1>
-    <p class="sub">Paste link YouTube ceramah -> AI pilih momen terbaik -> Potong 9:16 + Subtitle Otomatis</p>
+    <p class="sub">Paste link YouTube atau upload video MP4 -> AI pilih momen terbaik -> Potong 9:16 + Subtitle Otomatis</p>
 
     <div class="card">
       {% if not has_server_keys %}
@@ -65,9 +65,16 @@
 
       <div class="grid-2">
         <div>
-          <label>Link Video YouTube Ceramah</label>
+          <label>Opsi 1: Link Video YouTube Ceramah</label>
           <input type="text" id="ytUrl" placeholder="[https://www.youtube.com/watch?v=](https://www.youtube.com/watch?v=)...">
         </div>
+        <div>
+          <label>Opsi 2: Atau Upload Video MP4 Langsung</label>
+          <input type="file" id="videoFile" accept="video/mp4,video/*">
+        </div>
+      </div>
+
+      <div class="grid-2">
         <div>
           <label>Jumlah Klip Otomatis</label>
           <select id="numClips">
@@ -76,11 +83,10 @@
             <option value="5">5 Klip Terbaik</option>
           </select>
         </div>
-      </div>
-
-      <div>
-        <label>Password Akses (Jika diatur di server)</label>
-        <input type="password" id="appPass" placeholder="Masukkan password pribadi...">
+        <div>
+          <label>Password Akses</label>
+          <input type="password" id="appPass" placeholder="Masukkan password pribadi...">
+        </div>
       </div>
 
       <button id="btnGenerate" onclick="generateClips()">Buat Klip TikTok Sekarang</button>
@@ -90,7 +96,7 @@
 
     <div id="loader" class="loader">
       <div class="spinner"></div>
-      <div id="loaderText">Sedang memproses video di server...<br><small style="color:#94a3b8">Proses ini memakan waktu 1–3 menit tergantung durasi video YouTube.</small></div>
+      <div id="loaderText">Sedang memproses video di server...<br><small style="color:#94a3b8">Proses ini memakan waktu 1–3 menit tergantung durasi video.</small></div>
     </div>
 
     <div id="results" class="clips-grid"></div>
@@ -111,6 +117,7 @@
 
     async function generateClips() {
       const url = document.getElementById("ytUrl").value.trim();
+      const videoFile = document.getElementById("videoFile").files[0];
       const groq_key = document.getElementById("groqKey") ? document.getElementById("groqKey").value.trim() : "";
       const gemini_key = document.getElementById("geminiKey") ? document.getElementById("geminiKey").value.trim() : "";
       const password = document.getElementById("appPass").value.trim();
@@ -124,8 +131,8 @@
       errorBox.style.display = "none";
       results.innerHTML = "";
 
-      if (!url) {
-        errorBox.textContent = "Harap isi Link YouTube terlebih dahulu.";
+      if (!url && !videoFile) {
+        errorBox.textContent = "Harap isi Link YouTube atau pilih file video MP4 terlebih dahulu.";
         errorBox.style.display = "block";
         return;
       }
@@ -134,14 +141,21 @@
       if (gemini_key) localStorage.setItem("gemini_key", gemini_key);
       if (password) localStorage.setItem("app_pass", password);
 
+      const formData = new FormData();
+      formData.append("url", url);
+      if (videoFile) formData.append("video_file", videoFile);
+      formData.append("groq_key", groq_key);
+      formData.append("gemini_key", gemini_key);
+      formData.append("password", password);
+      formData.append("num_clips", num_clips);
+
       btn.disabled = true;
       loader.style.display = "block";
 
       try {
         const res = await fetch("/api/generate", {
           method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ url, groq_key, gemini_key, password, num_clips })
+          body: formData
         });
         const data = await res.json();
 
