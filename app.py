@@ -257,18 +257,26 @@ Transkrip Ceramah:
 """
 
     gemini_host = "generativelanguage.googleapis.com"
-    gemini_path = "/v1beta/models/gemini-2.5-flash:generateContent"
-    endpoint_url = "https://" + gemini_host + gemini_path + "?key=" + gemini_key
+    models_to_try = ["gemini-3.8-flash", "gemini-3.0-flash", "gemini-2.5-flash"]
 
     payload = {
         "contents": [{"parts": [{"text": prompt}]}],
         "generationConfig": {"temperature": 0.4}
     }
-    resp = requests.post(endpoint_url, json=payload, timeout=120)
-    if resp.status_code != 200:
-        raise RuntimeError(f"Gemini Error ({resp.status_code}): {resp.text[:300]}")
 
-    res_json = resp.json()
+    res_json = None
+    last_err = ""
+    for model_name in models_to_try:
+        endpoint_url = f"https://{gemini_host}/v1beta/models/{model_name}:generateContent?key={gemini_key}"
+        resp = requests.post(endpoint_url, json=payload, timeout=120)
+        if resp.status_code == 200:
+            res_json = resp.json()
+            break
+        last_err = f"Gemini Error ({resp.status_code}): {resp.text[:300]}"
+
+    if not res_json:
+        raise RuntimeError(last_err)
+
     candidates = res_json.get("candidates") if isinstance(res_json, dict) else None
     if not candidates or not isinstance(candidates, list):
         raise RuntimeError(f"Gemini tidak mengembalikan kandidat jawaban: {str(res_json)[:300]}")
