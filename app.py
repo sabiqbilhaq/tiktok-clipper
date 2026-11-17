@@ -20,8 +20,17 @@ def download_youtube(url, job_id):
     video_path = os.path.join(DOWNLOAD_DIR, f"{job_id}.mp4")
     audio_path = os.path.join(DOWNLOAD_DIR, f"{job_id}.mp3")
 
+    cookie_args = []
+    yt_cookies = os.environ.get("YOUTUBE_COOKIES", "").strip()
+    if yt_cookies:
+        cookie_path = os.path.join(DOWNLOAD_DIR, "cookies.txt")
+        with open(cookie_path, "w", encoding="utf-8") as cf:
+            cf.write(yt_cookies + "\n")
+        cookie_args = ["--cookies", cookie_path]
+
     cmd_vid = [
         "yt-dlp",
+        *cookie_args,
         "--no-playlist",
         "-f", "bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/best[height<=720][ext=mp4]/best",
         "--merge-output-format", "mp4",
