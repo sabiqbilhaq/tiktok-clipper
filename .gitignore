@@ -1,0 +1,5 @@
+venv/
+bin/
+downloads/
+static/clips/*
+__pycache__/

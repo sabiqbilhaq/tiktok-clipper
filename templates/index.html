@@ -1,0 +1,171 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Auto Clipper Ceramah AI</title>
+  <style>
+    * { box-sizing: border-box; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+    body { background: #0f172a; color: #f8fafc; margin: 0; padding: 24px; }
+    .container { max-width: 960px; margin: 0 auto; }
+    h1 { font-size: 1.6rem; margin-bottom: 4px; color: #38bdf8; }
+    p.sub { color: #94a3b8; margin-top: 0; margin-bottom: 24px; font-size: 0.95rem; }
+    .card { background: #1e293b; padding: 20px; border-radius: 12px; border: 1px solid #334155; margin-bottom: 24px; }
+    .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+    @media (max-width: 640px) { .grid-2 { grid-template-columns: 1fr; } }
+    label { display: block; font-size: 0.85rem; color: #cbd5e1; margin-bottom: 6px; font-weight: 600; }
+    input, select {
+      width: 100%; padding: 10px 12px; border-radius: 8px; border: 1px solid #475569;
+      background: #0f172a; color: #fff; font-size: 0.95rem; margin-bottom: 14px;
+    }
+    input:focus { outline: none; border-color: #38bdf8; }
+    button {
+      width: 100%; padding: 12px; background: #0284c7; color: white; border: none;
+      border-radius: 8px; font-size: 1rem; font-weight: 600; cursor: pointer; transition: 0.2s;
+    }
+    button:hover { background: #0369a1; }
+    button:disabled { background: #475569; cursor: not-allowed; }
+    .loader { display: none; text-align: center; padding: 24px; background: #1e293b; border-radius: 12px; margin-bottom: 24px; }
+    .spinner {
+      width: 36px; height: 36px; border: 4px solid #334155; border-top-color: #38bdf8;
+      border-radius: 50%; animation: spin 1s linear infinite; margin: 0 auto 12px;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    .clips-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 20px; }
+    .clip-card { background: #1e293b; border-radius: 12px; padding: 16px; border: 1px solid #334155; }
+    .clip-card video { width: 100%; border-radius: 8px; background: #000; aspect-ratio: 9/16; }
+    .clip-title { font-weight: 700; font-size: 1.05rem; margin: 10px 0 4px; color: #facc15; }
+    .clip-reason { font-size: 0.85rem; color: #94a3b8; margin-bottom: 12px; }
+    .dl-btn {
+      display: block; text-align: center; background: #16a34a; color: #fff;
+      text-decoration: none; padding: 10px; border-radius: 8px; font-weight: 600; font-size: 0.9rem;
+    }
+    .dl-btn:hover { background: #15803d; }
+    .error-box { display: none; background: #7f1d1d; color: #fecaca; padding: 14px; border-radius: 8px; margin-bottom: 20px; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>Auto Clipper Ceramah AI</h1>
+    <p class="sub">Paste link YouTube ceramah -> AI pilih momen terbaik -> Potong 9:16 + Subtitle Otomatis</p>
+
+    <div class="card">
+      {% if not has_server_keys %}
+      <div class="grid-2">
+        <div>
+          <label>Groq API Key</label>
+          <input type="password" id="groqKey" placeholder="gsk_...">
+        </div>
+        <div>
+          <label>Gemini API Key</label>
+          <input type="password" id="geminiKey" placeholder="AQ... atau AIza...">
+        </div>
+      </div>
+      {% endif %}
+
+      <div class="grid-2">
+        <div>
+          <label>Link Video YouTube Ceramah</label>
+          <input type="text" id="ytUrl" placeholder="[https://www.youtube.com/watch?v=](https://www.youtube.com/watch?v=)...">
+        </div>
+        <div>
+          <label>Jumlah Klip Otomatis</label>
+          <select id="numClips">
+            <option value="2">2 Klip Terbaik</option>
+            <option value="3" selected>3 Klip Terbaik</option>
+            <option value="5">5 Klip Terbaik</option>
+          </select>
+        </div>
+      </div>
+
+      <div>
+        <label>Password Akses (Jika diatur di server)</label>
+        <input type="password" id="appPass" placeholder="Masukkan password pribadi...">
+      </div>
+
+      <button id="btnGenerate" onclick="generateClips()">Buat Klip TikTok Sekarang</button>
+    </div>
+
+    <div id="errorBox" class="error-box"></div>
+
+    <div id="loader" class="loader">
+      <div class="spinner"></div>
+      <div id="loaderText">Sedang memproses video di server...<br><small style="color:#94a3b8">Proses ini memakan waktu 1–3 menit tergantung durasi video YouTube.</small></div>
+    </div>
+
+    <div id="results" class="clips-grid"></div>
+  </div>
+
+  <script>
+    window.onload = () => {
+      if (document.getElementById("groqKey") && localStorage.getItem("groq_key")) {
+        document.getElementById("groqKey").value = localStorage.getItem("groq_key");
+      }
+      if (document.getElementById("geminiKey") && localStorage.getItem("gemini_key")) {
+        document.getElementById("geminiKey").value = localStorage.getItem("gemini_key");
+      }
+      if (localStorage.getItem("app_pass")) {
+        document.getElementById("appPass").value = localStorage.getItem("app_pass");
+      }
+    };
+
+    async function generateClips() {
+      const url = document.getElementById("ytUrl").value.trim();
+      const groq_key = document.getElementById("groqKey") ? document.getElementById("groqKey").value.trim() : "";
+      const gemini_key = document.getElementById("geminiKey") ? document.getElementById("geminiKey").value.trim() : "";
+      const password = document.getElementById("appPass").value.trim();
+      const num_clips = document.getElementById("numClips").value;
+
+      const errorBox = document.getElementById("errorBox");
+      const loader = document.getElementById("loader");
+      const results = document.getElementById("results");
+      const btn = document.getElementById("btnGenerate");
+
+      errorBox.style.display = "none";
+      results.innerHTML = "";
+
+      if (!url) {
+        errorBox.textContent = "Harap isi Link YouTube terlebih dahulu.";
+        errorBox.style.display = "block";
+        return;
+      }
+
+      if (groq_key) localStorage.setItem("groq_key", groq_key);
+      if (gemini_key) localStorage.setItem("gemini_key", gemini_key);
+      if (password) localStorage.setItem("app_pass", password);
+
+      btn.disabled = true;
+      loader.style.display = "block";
+
+      try {
+        const res = await fetch("/api/generate", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ url, groq_key, gemini_key, password, num_clips })
+        });
+        const data = await res.json();
+
+        if (!res.ok) throw new Error(data.error || "Terjadi kesalahan pada server.");
+
+        data.clips.forEach((clip) => {
+          const card = document.createElement("div");
+          card.className = "clip-card";
+          card.innerHTML = `
+            <video src="${clip.video_url}" controls playsinline></video>
+            <div class="clip-title">${clip.title}</div>
+            <div class="clip-reason">${clip.reason} (${Math.round(clip.end_time - clip.start_time)} detik)</div>
+            <a class="dl-btn" href="${clip.video_url}" download="${clip.filename}">Download Video MP4</a>
+          `;
+          results.appendChild(card);
+        });
+      } catch (err) {
+        errorBox.textContent = "Error: " + err.message;
+        errorBox.style.display = "block";
+      } finally {
+        btn.disabled = false;
+        loader.style.display = "none";
+      }
+    }
+  </script>
+</body>
+</html>
