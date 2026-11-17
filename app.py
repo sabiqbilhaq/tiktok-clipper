@@ -211,6 +211,34 @@ def extract_words_safe(transcript_json):
     return fallback_words
 
 
+def get_available_gemini_models(gemini_key):
+    """Ambil daftar model Gemini yang benar-benar aktif untuk API key ini."""
+    list_url = f"https://generativelanguage.googleapis.com/v1beta/models?key={gemini_key}"
+    try:
+        r = requests.get(list_url, timeout=20)
+        if r.status_code == 200:
+            models_data = r.json().get("models") or []
+            valid_flash = []
+            valid_others = []
+            for m in models_data:
+                methods = m.get("supportedGenerationMethods") or []
+                name = str(m.get("name") or "")
+                if "generateContent" in methods and "gemini" in name.lower():
+                    short_name = name.replace("models/", "")
+                    if "flash" in short_name.lower() and "image" not in short_name.lower() and "audio" not in short_name.lower():
+                        valid_flash.append(short_name)
+                    else:
+                        valid_others.append(short_name)
+            # Urutkan flash terbaru di depan
+            valid_flash.sort(reverse=True)
+            combined = valid_flash + valid_others
+            if combined:
+                return combined
+    except Exception:
+        pass
+    return ["gemini-3.8-flash", "gemini-3.0-flash", "gemini-2.5-flash"]
+
+
 def find_viral_clips_gemini(transcript_json, gemini_key, num_clips=3):
     segments = transcript_json.get("segments") if isinstance(transcript_json, dict) else []
     if not isinstance(segments, list):
@@ -257,7 +285,7 @@ Transkrip Ceramah:
 """
 
     gemini_host = "generativelanguage.googleapis.com"
-    models_to_try = ["gemini-3.8-flash", "gemini-3.0-flash", "gemini-2.5-flash"]
+    models_to_try = get_available_gemini_models(gemini_key)
 
     payload = {
         "contents": [{"parts": [{"text": prompt}]}],
@@ -265,17 +293,17 @@ Transkrip Ceramah:
     }
 
     res_json = None
-    last_err = ""
-    for model_name in models_to_try:
+    errors_log = []
+    for model_name in models_to_try[:5]:
         endpoint_url = f"https://{gemini_host}/v1beta/models/{model_name}:generateContent?key={gemini_key}"
         resp = requests.post(endpoint_url, json=payload, timeout=120)
         if resp.status_code == 200:
             res_json = resp.json()
             break
-        last_err = f"Gemini Error ({resp.status_code}): {resp.text[:300]}"
+        errors_log.append(f"[{model_name}] ({resp.status_code}): {resp.text[:160]}")
 
     if not res_json:
-        raise RuntimeError(last_err)
+        raise RuntimeError("Semua model Gemini gagal: " + " | ".join(errors_log))
 
     candidates = res_json.get("candidates") if isinstance(res_json, dict) else None
     if not candidates or not isinstance(candidates, list):
