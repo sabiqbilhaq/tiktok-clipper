@@ -8,7 +8,6 @@ from flask import Flask, render_template, request, jsonify
 
 app = Flask(__name__)
 
-# Otomatis pakai ffmpeg sistem jika di server Linux, atau bin/ffmpeg jika di Mac lokal
 FFMPEG_BIN = shutil.which("ffmpeg") or os.path.abspath("bin/ffmpeg")
 DOWNLOAD_DIR = os.path.abspath("downloads")
 CLIPS_DIR = os.path.abspath("static/clips")
@@ -23,6 +22,7 @@ def download_youtube(url, job_id):
 
     cmd_vid = [
         "yt-dlp",
+        "--extractor-args", "youtube:player_client=android,web",
         "-f", "bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/best[height<=720][ext=mp4]/best",
         "--merge-output-format", "mp4",
         "-o", video_path,
@@ -45,25 +45,58 @@ def transcribe_groq(audio_path, groq_key):
     headers = {"Authorization": f"Bearer {groq_key}"}
     with open(audio_path, "rb") as f:
         files = {"file": (os.path.basename(audio_path), f, "audio/mpeg")}
-        data = {
-            "model": "whisper-large-v3",
-            "language": "id",
-            "response_format": "verbose_json",
-            "timestamp_granularities[]": "word"
-        }
+        data = [
+            ("model", "whisper-large-v3"),
+            ("language", "id"),
+            ("response_format", "verbose_json"),
+            ("timestamp_granularities[]", "word"),
+            ("timestamp_granularities[]", "segment")
+        ]
         resp = requests.post(url, headers=headers, files=files, data=data, timeout=300)
         resp.raise_for_status()
         return resp.json()
 
 
+def extract_words_safe(transcript_json):
+    # Ambil daftar kata jika tersedia
+    words = transcript_json.get("words") or []
+    if words:
+        return words
+
+    # Fallback: pecah per kata dari segments jika Groq hanya mengembalikan segments
+    segments = transcript_json.get("segments") or []
+    fallback_words = []
+    for seg in segments:
+        seg_words = seg.get("words") or []
+        if seg_words:
+            fallback_words.extend(seg_words)
+        else:
+            tokens = seg.get("text", "").strip().split()
+            if not tokens:
+                continue
+            s_start = float(seg.get("start", 0))
+            s_end = float(seg.get("end", s_start + 1))
+            step = (s_end - s_start) / len(tokens)
+            for i, tok in enumerate(tokens):
+                fallback_words.append({
+                    "word": tok,
+                    "start": s_start + i * step,
+                    "end": s_start + (i + 1) * step
+                })
+    return fallback_words
+
+
 def find_viral_clips_gemini(transcript_json, gemini_key, num_clips=3):
-    segments = transcript_json.get("segments", [])
+    segments = transcript_json.get("segments") or []
     formatted_transcript = ""
     for seg in segments:
-        start = round(seg["start"], 1)
-        end = round(seg["end"], 1)
-        text = seg["text"].strip()
+        start = round(float(seg.get("start", 0)), 1)
+        end = round(float(seg.get("end", 0)), 1)
+        text = seg.get("text", "").strip()
         formatted_transcript += f"[{start}s - {end}s] {text}\n"
+
+    if not formatted_transcript.strip():
+        raise ValueError("Transkrip audio kosong. Pastikan video YouTube memiliki suara ceramah yang jelas.")
 
     prompt = f"""
 Kamu adalah editor ahli konten TikTok dakwah/ceramah ustadz Indonesia.
@@ -118,12 +151,12 @@ def format_ass_time(seconds):
 
 def create_ass_subtitle(words, start_clip, end_clip, title, ass_path):
     clip_words = []
-    for w in words:
-        w_start = w["start"]
-        w_end = w["end"]
+    for w in (words or []):
+        w_start = float(w.get("start", 0))
+        w_end = float(w.get("end", 0))
         if w_end >= start_clip and w_start <= end_clip:
             clip_words.append({
-                "word": w["word"].strip(),
+                "word": str(w.get("word", "")).strip(),
                 "start": max(0.0, w_start - start_clip),
                 "end": max(0.1, w_end - start_clip)
             })
@@ -202,7 +235,7 @@ def index():
 
 @app.route("/api/generate", methods=["POST"])
 def generate():
-    data = request.json
+    data = request.json or {}
     app_pass = os.environ.get("APP_PASSWORD", "")
     if app_pass and data.get("password", "") != app_pass:
         return jsonify({"error": "Password akses salah!"}), 401
@@ -220,8 +253,8 @@ def generate():
     try:
         video_path, audio_path = download_youtube(yt_url, job_id)
         transcript = transcribe_groq(audio_path, groq_key)
-        words = transcript.get("words", [])
-        clips_meta = find_viral_clips_gemini(transcript, gemini_key, num_clips)
+        words = extract_words_safe(transcript)
+        clips_meta = find_viral_clips_gemini(transcript, gemini_key, num_clips) or []
 
         results = []
         for idx, clip in enumerate(clips_meta, start=1):
