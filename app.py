@@ -49,6 +49,16 @@ def extract_video_id(yt_url):
     return ""
 
 
+def get_media_duration(media_path):
+    cmd = [FFMPEG_BIN, "-i", media_path]
+    res = subprocess.run(cmd, capture_output=True, text=True)
+    m = re.search(r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)", res.stderr or "")
+    if m:
+        h, mn, s = float(m.group(1)), float(m.group(2)), float(m.group(3))
+        return h * 3600 + mn * 60 + s
+    return 0.0
+
+
 def extract_audio(video_path, audio_path):
     cmd_aud = [
         FFMPEG_BIN, "-y",
@@ -173,7 +183,7 @@ def get_available_gemini_models(gemini_key):
     return ["gemini-3.8-flash", "gemini-3.0-flash", "gemini-2.5-flash"]
 
 
-def find_viral_clips_gemini(transcript_json, gemini_key, num_clips=3):
+def find_viral_clips_gemini(transcript_json, gemini_key, num_clips=3, total_duration=0.0):
     segments = transcript_json.get("segments") if isinstance(transcript_json, dict) else []
     if not isinstance(segments, list):
         segments = []
@@ -190,26 +200,30 @@ def find_viral_clips_gemini(transcript_json, gemini_key, num_clips=3):
     if not formatted_transcript.strip():
         raw_text_full = str(transcript_json.get("text") or "").strip()
         if raw_text_full:
-            formatted_transcript = f"[0.0s - 60.0s] {raw_text_full}\n"
+            end_fallback = round(total_duration, 1) if total_duration > 0 else 60.0
+            formatted_transcript = f"[0.0s - {end_fallback}s] {raw_text_full}\n"
         else:
             raise ValueError("Transkrip audio dari Groq kosong.")
+
+    dur_note = f"Total durasi video asli adalah {round(total_duration, 1)} detik. Semua start_time dan end_time WAJIB berada di antara 0 dan {round(total_duration, 1)}." if total_duration > 0 else ""
 
     prompt = f"""
 Kamu adalah editor ahli konten TikTok dakwah/ceramah ustadz Indonesia.
 Analisislah transkrip ceramah berikut beserta timestamp detiknya, lalu pilih {num_clips} potongan (klip) terbaik yang paling menyentuh hati, punya hook kuat di awal, bermakna utuh, dan berpotensi FYP/viral di TikTok.
 
 Aturan ketat:
-1. Durasi setiap klip WAJIB antara 60 detik hingga 90 detik.
-2. Titik mulai (start_time) dan selesai (end_time) harus pas di awal kalimat dan akhir kalimat yang utuh.
-3. Berikan judul hook singkat (maksimal 6 kata) yang menarik perhatian untuk dipasang di bagian atas video.
-4. Kembalikan HANYA format JSON valid berupa array objek tanpa markdown ```json atau teks tambahan apa pun.
+1. {dur_note}
+2. Durasi setiap klip diusahakan antara 60 detik hingga 90 detik (atau menyesuaikan jika total durasi video lebih pendek).
+3. Titik mulai (start_time) dan selesai (end_time) harus pas di awal kalimat dan akhir kalimat yang utuh.
+4. Berikan judul hook singkat (maksimal 6 kata) yang menarik perhatian untuk dipasang di bagian atas video.
+5. Kembalikan HANYA format JSON valid berupa array objek tanpa markdown ```json atau teks tambahan apa pun.
 
 Format JSON wajib:
 [
   {{
     "title": "Judul Hook Singkat",
-    "start_time": 120.5,
-    "end_time": 195.0,
+    "start_time": 12.5,
+    "end_time": 75.0,
     "reason": "Alasan singkat kenapa bagian ini menarik"
   }}
 ]
@@ -337,7 +351,7 @@ def render_clip(video_path, ass_path, start_time, end_time, output_path):
 
     cmd = [
         FFMPEG_BIN, "-y",
-        "-loglevel", "error",
+        "-loglevel", "warning",
         "-ss", str(start_time),
         "-i", video_path,
         "-t", str(duration),
@@ -351,8 +365,9 @@ def render_clip(video_path, ass_path, start_time, end_time, output_path):
         output_path
     ]
     res = subprocess.run(cmd, capture_output=True, text=True)
-    if res.returncode != 0 or not os.path.exists(output_path) or os.path.getsize(output_path) < 10000:
-        err_msg = (res.stderr or "FFmpeg tidak menghasilkan output").strip()[-400:]
+    out_size = os.path.getsize(output_path) if os.path.exists(output_path) else 0
+    if res.returncode != 0 or out_size < 10000:
+        err_msg = (res.stderr or res.stdout or f"returncode={res.returncode}, size={out_size}, ss={start_time}, dur={duration}").strip()[-450:]
         raise RuntimeError(f"FFmpeg render error: {err_msg}")
 
 
@@ -383,14 +398,24 @@ def generate():
 
     try:
         video_path, audio_path = download_youtube(yt_url, job_id)
+        total_dur = get_media_duration(video_path)
         transcript = transcribe_groq(audio_path, groq_key)
         words = extract_words_safe(transcript)
-        clips_meta = find_viral_clips_gemini(transcript, gemini_key, num_clips)
+        clips_meta = find_viral_clips_gemini(transcript, gemini_key, num_clips, total_dur)
 
         results = []
         for idx, clip in enumerate(clips_meta, start=1):
-            start_t = float(clip["start_time"])
-            end_t = float(clip["end_time"])
+            start_t = max(0.0, float(clip.get("start_time") or 0))
+            end_t = float(clip.get("end_time") or (start_t + 60.0))
+
+            if total_dur > 5.0:
+                if start_t >= total_dur - 3.0:
+                    start_t = max(0.0, total_dur - 65.0)
+                if end_t > total_dur:
+                    end_t = total_dur
+            if end_t <= start_t + 2.0:
+                end_t = min(total_dur, start_t + 60.0) if total_dur > 5.0 else (start_t + 60.0)
+
             title = str(clip.get("title") or f"Klip Ceramah #{idx}")
             reason = str(clip.get("reason") or "")
 
@@ -404,8 +429,8 @@ def generate():
             results.append({
                 "title": title,
                 "reason": reason,
-                "start_time": start_t,
-                "end_time": end_t,
+                "start_time": round(start_t, 1),
+                "end_time": round(end_t, 1),
                 "video_url": f"/static/clips/{out_filename}",
                 "filename": out_filename
             })
