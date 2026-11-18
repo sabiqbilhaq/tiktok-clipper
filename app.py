@@ -66,12 +66,13 @@ def download_youtube(url, job_id):
     if not cookie_file:
         raise RuntimeError("Variable YOUTUBE_COOKIES belum diisi di Railway!")
 
+    # Paksa codec H.264 (avc1) agar 100% kompatibel dengan FFmpeg & cepat di-render
     cmd_vid = [
         "yt-dlp",
         "--no-playlist",
         "--cookies", cookie_file,
         "--js-runtimes", "node",
-        "-f", "bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/best[height<=720][ext=mp4]/best[ext=mp4]/best",
+        "-f", "bestvideo[vcodec^=avc1][height<=720][ext=mp4]+bestaudio[ext=m4a]/best[vcodec^=avc1][height<=720][ext=mp4]/best[height<=720][ext=mp4]/best",
         "--merge-output-format", "mp4",
         "-o", video_path,
         clean_url
@@ -288,8 +289,8 @@ WrapStyle: 1
 
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-Style: SubStyle,DejaVu Sans,64,&H00FFFFFF,&H0000FFFF,&H00000000,&H80000000,-1,0,0,0,100,100,0,0,1,5,2,2,60,60,340,1
-Style: TitleStyle,DejaVu Sans,58,&H0000FFFF,&H00FFFFFF,&H00000000,&H99000000,-1,0,0,0,100,100,0,0,3,6,0,8,70,70,180,1
+Style: SubStyle,sans-serif,64,&H00FFFFFF,&H0000FFFF,&H00000000,&H80000000,-1,0,0,0,100,100,0,0,1,5,2,2,60,60,340,1
+Style: TitleStyle,sans-serif,58,&H0000FFFF,&H00FFFFFF,&H00000000,&H99000000,-1,0,0,0,100,100,0,0,3,6,0,8,70,70,180,1
 
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
@@ -326,15 +327,17 @@ Dialogue: 1,0:00:00.00,{format_ass_time(duration)},TitleStyle,,0,0,0,,{title.upp
 def render_clip(video_path, ass_path, start_time, end_time, output_path):
     duration = max(1.0, end_time - start_time)
     escaped_ass = ass_path.replace("\\", "/").replace(":", "\\:")
-    vf_filter = f"crop=ih*9/16:ih:(iw-ih*9/16)/2:0,scale=1080:1920,subtitles='{escaped_ass}'"
+    vf_filter = f"crop=ih*9/16:ih:(iw-ih*9/16)/2:0,scale=1080:1920,ass='{escaped_ass}'"
 
     cmd = [
         FFMPEG_BIN, "-y",
+        "-loglevel", "error",
         "-ss", str(start_time),
         "-i", video_path,
         "-t", str(duration),
         "-vf", vf_filter,
         "-c:v", "libx264",
+        "-pix_fmt", "yuv420p",
         "-preset", "veryfast",
         "-crf", "23",
         "-c:a", "aac",
@@ -342,8 +345,9 @@ def render_clip(video_path, ass_path, start_time, end_time, output_path):
         output_path
     ]
     res = subprocess.run(cmd, capture_output=True, text=True)
-    if res.returncode != 0:
-        raise RuntimeError(f"FFmpeg render error: {res.stderr[-300:]}")
+    if res.returncode != 0 or not os.path.exists(output_path) or os.path.getsize(output_path) < 10000:
+        err_msg = (res.stderr or "FFmpeg tidak menghasilkan output").strip()[-400:]
+        raise RuntimeError(f"FFmpeg render error: {err_msg}")
 
 
 @app.route("/")
