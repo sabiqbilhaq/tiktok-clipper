@@ -39,7 +39,7 @@ def collect_candidate_urls(obj, found=None):
         if obj.startswith("http") and "youtube.com" not in obj and "youtu.be" not in obj:
             found.append(obj)
     elif isinstance(obj, dict):
-        priority_keys = ["download_url", "downloadUrl", "dlink", "mp4", "link", "url", "file", "result"]
+        priority_keys = ["downloadUrl", "download_url", "dlink", "mp4", "link", "url", "file", "result"]
         for k in priority_keys:
             if k in obj:
                 collect_candidate_urls(obj[k], found)
@@ -70,67 +70,90 @@ def download_via_rapidapi(yt_url, video_path):
         "x-rapidapi-host": rapid_host
     }
 
-    opachi_payloads = [
-        {"id": vid_id, "type": "merged", "quality": "720p"},
-        {"id": vid_id, "type": "merged", "quality": "480p"},
-        {"id": vid_id, "type": "merged"}
-    ]
+    # Cukup 1x POST awal dengan kualitas 480p agar konversi cepat & hemat kuota
+    body = {"id": vid_id, "type": "merged", "quality": "480p"}
 
-    last_err = "Tidak ada respons dari server RapidAPI."
-    for body in opachi_payloads:
-        try:
-            candidates = []
-            for attempt in range(15):
-                resp = requests.post(rapid_endpoint, headers=headers, json=body, timeout=45)
-                if resp.status_code not in (200, 201, 202):
-                    last_err = f"HTTP {resp.status_code}: {resp.text[:250]}"
-                    break
+    try:
+        resp = requests.post(rapid_endpoint, headers=headers, json=body, timeout=45)
+        if resp.status_code not in (200, 201, 202):
+            return False, f"HTTP {resp.status_code}: {resp.text[:250]}"
 
-                data = resp.json()
-                last_err = f"Respons terakhir API: {str(data)[:260]}"
+        data = resp.json()
+        candidates = collect_candidate_urls(data)
+        uid = data.get("uid")
+
+        # Jika masih IN_QUEUE / PROCESSING, pantau statusnya hingga maksimal 2 menit (24 x 5 detik)
+        if not candidates and uid:
+            base_api = rapid_endpoint.rsplit("/", 1)[0]
+            status_endpoints = [
+                ("GET", f"{base_api}/status/{uid}", None),
+                ("GET", f"{base_api}/status", {"uid": uid}),
+                ("POST", rapid_endpoint, body)
+            ]
+
+            for _ in range(24):
+                time.sleep(5)
+                polled = False
+                for m_type, s_url, s_payload in status_endpoints:
+                    try:
+                        if m_type == "GET":
+                            s_resp = requests.get(s_url, headers=headers, params=s_payload, timeout=30)
+                        else:
+                            s_resp = requests.post(s_url, headers=headers, json=s_payload, timeout=30)
+
+                        if s_resp.status_code == 200:
+                            data = s_resp.json()
+                            polled = True
+                            break
+                    except Exception:
+                        continue
+
+                if not polled:
+                    continue
+
                 candidates = collect_candidate_urls(data)
                 if candidates:
                     break
 
-                # Jika belum ada URL, tunggu 4 detik lalu cek status konversi lagi
-                err_flag = str(data.get("error") or data.get("status") or "").lower()
-                if "fail" in err_flag or "error" in err_flag or "invalid" in err_flag or "live" in err_flag:
-                    break
-                time.sleep(4)
+                state_val = str(data.get("state") or data.get("status") or "").upper()
+                err_val = data.get("error")
+                if state_val in ("FAILED", "ERROR") or (err_val and str(err_val).lower() != "none"):
+                    return False, f"Konversi gagal di server API: {str(data)[:250]}"
 
-            if not candidates:
+        if not candidates:
+            return False, f"Timeout menunggu konversi selesai. Respons terakhir: {str(data)[:250]}"
+
+        non_gv = [u for u in candidates if "googlevideo.com" not in u]
+        gv_bypass = [u for u in candidates if "googlevideo.com" in u and "ipbypass=yes" in u]
+        ordered_urls = non_gv + gv_bypass if (non_gv or gv_bypass) else candidates
+
+        last_dl_err = "Gagal mengunduh file dari downloadUrl."
+        for dl_url in ordered_urls[:5]:
+            try:
+                with requests.get(dl_url, stream=True, timeout=240, headers={"User-Agent": "Mozilla/5.0"}) as vid_r:
+                    if vid_r.status_code != 200:
+                        last_dl_err = f"CDN mengembalikan HTTP {vid_r.status_code}"
+                        continue
+                    ctype = str(vid_r.headers.get("Content-Type") or "").lower()
+                    if "text/html" in ctype or "application/json" in ctype:
+                        last_dl_err = f"CDN mengembalikan {ctype}, bukan file MP4."
+                        continue
+                    with open(video_path, "wb") as f:
+                        for chunk in vid_r.iter_content(chunk_size=1024 * 256):
+                            if chunk:
+                                f.write(chunk)
+
+                if os.path.exists(video_path) and os.path.getsize(video_path) > 100000:
+                    return True, ""
+                last_dl_err = "File MP4 terunduh terlalu kecil (<100KB)."
+            except Exception as dl_e:
+                last_dl_err = str(dl_e)
                 continue
 
-            non_gv = [u for u in candidates if "googlevideo.com" not in u]
-            gv_bypass = [u for u in candidates if "googlevideo.com" in u and "ipbypass=yes" in u]
-            ordered_urls = non_gv + gv_bypass if (non_gv or gv_bypass) else candidates
+        return False, last_dl_err
 
-            for dl_url in ordered_urls[:5]:
-                try:
-                    with requests.get(dl_url, stream=True, timeout=240, headers={"User-Agent": "Mozilla/5.0"}) as vid_r:
-                        if vid_r.status_code != 200:
-                            last_err = f"Gagal unduh file dari CDN ({vid_r.status_code})"
-                            continue
-                        ctype = str(vid_r.headers.get("Content-Type") or "").lower()
-                        if "text/html" in ctype or "application/json" in ctype:
-                            last_err = f"CDN mengembalikan halaman {ctype}, bukan video."
-                            continue
-                        with open(video_path, "wb") as f:
-                            for chunk in vid_r.iter_content(chunk_size=1024 * 256):
-                                if chunk:
-                                    f.write(chunk)
-
-                    if os.path.exists(video_path) and os.path.getsize(video_path) > 100000:
-                        return True, ""
-                    last_err = "File video terunduh terlalu kecil (<100KB)."
-                except Exception as dl_e:
-                    last_err = f"Error unduh CDN: {str(dl_e)}"
-                    continue
-
-        except Exception as e:
-            last_err = f"Request error: {str(e)}"
-
-    return False, last_err
+    except Exception as e:
+        return False, f"Request error: {str(e)}"
 
 
 def extract_audio(video_path, audio_path):
