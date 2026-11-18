@@ -24,7 +24,6 @@ def prepare_cookies_file():
     raw_cookies = (os.environ.get("YOUTUBE_COOKIES") or "").strip()
     if not raw_cookies:
         return None
-    # Jika formatnya Base64 (tidak diawali # Netscape), decode dulu ke teks asli
     if not raw_cookies.startswith("#") and ".youtube.com" not in raw_cookies[:100]:
         try:
             decoded = base64.b64decode(raw_cookies).decode("utf-8", errors="ignore")
@@ -80,7 +79,8 @@ def download_youtube(url, job_id):
         "--no-playlist",
         "--cookies", cookie_file,
         "--js-runtimes", "node",
-        "-f", "bestvideo[vcodec^=avc1][height<=720][ext=mp4]+bestaudio[ext=m4a]/best[vcodec^=avc1][height<=720][ext=mp4]/best[height<=720][ext=mp4]/best",
+        "--remote-components", "ejs:github",
+        "-f", "bv*[vcodec^=avc1][height<=720]+ba[ext=m4a]/bv*[height<=720]+ba/b[height<=720]/b",
         "--merge-output-format", "mp4",
         "-o", video_path,
         clean_url
