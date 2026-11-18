@@ -52,17 +52,95 @@ def collect_candidate_urls(obj, found=None):
     return found
 
 
-def download_via_rapidapi(yt_url, video_path):
+def stream_download_file(dl_url, dest_path, referer=None):
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    }
+    if referer:
+        headers["Referer"] = referer
+    with requests.get(dl_url, stream=True, timeout=240, headers=headers) as r:
+        if r.status_code != 200:
+            return False, f"HTTP {r.status_code}"
+        ctype = str(r.headers.get("Content-Type") or "").lower()
+        if "text/html" in ctype or "application/json" in ctype:
+            return False, f"Bukan file media ({ctype})"
+        with open(dest_path, "wb") as f:
+            for chunk in r.iter_content(chunk_size=1024 * 256):
+                if chunk:
+                    f.write(chunk)
+    if os.path.exists(dest_path) and os.path.getsize(dest_path) > 100000:
+        return True, ""
+    return False, "Ukuran file terlalu kecil"
+
+
+def download_via_public_mirrors(yt_url, vid_id, video_path):
+    """Jalur 1: Gratis tanpa kuota lewat Cobalt instances & Piped API."""
+    cobalt_instances = [
+        "https://api.cobalt.tools/",
+        "https://cobalt-api.kwiatekmiki.com/",
+        "https://cobalt.canine.tools/",
+        "https://cbl.bloat.cat/"
+    ]
+    c_headers = {
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+        "User-Agent": "Mozilla/5.0"
+    }
+    c_payload = {
+        "url": yt_url,
+        "videoQuality": "480",
+        "filenameStyle": "basic"
+    }
+    for ep in cobalt_instances:
+        try:
+            r = requests.post(ep, json=c_payload, headers=c_headers, timeout=20)
+            if r.status_code == 200:
+                data = r.json()
+                dl_url = data.get("url")
+                if dl_url:
+                    ok, _ = stream_download_file(dl_url, video_path)
+                    if ok:
+                        return True, ""
+        except Exception:
+            continue
+
+    # Piped API public instances (menyediakan video stream ter-proxy bebas blokir IP)
+    piped_instances = [
+        "https://pipedapi.kavin.rocks",
+        "https://pipedapi.tokhmi.xyz",
+        "https://pipedapi.moomoo.me",
+        "https://api.piped.projectsegfau.lt"
+    ]
+    for p_base in piped_instances:
+        try:
+            r = requests.get(f"{p_base}/streams/{vid_id}", timeout=20, headers={"User-Agent": "Mozilla/5.0"})
+            if r.status_code != 200:
+                continue
+            pdata = r.json()
+            v_streams = pdata.get("videoStreams") or []
+            # Pilih video MP4 yang sudah ada audionya (videoOnly == False)
+            merged_streams = [
+                s for s in v_streams
+                if not s.get("videoOnly") and "mp4" in str(s.get("mimeType") or "").lower() and s.get("url")
+            ]
+            for st in merged_streams:
+                ok, _ = stream_download_file(st["url"], video_path)
+                if ok:
+                    return True, ""
+        except Exception:
+            continue
+
+    return False, "Mirror publik sedang sibuk."
+
+
+def download_via_rapidapi(yt_url, vid_id, video_path):
+    """Jalur 2: RapidAPI Opachi dengan payload lengkap & status polling uid."""
     rapid_key = (os.environ.get("RAPIDAPI_KEY") or "").strip()
     rapid_host = (os.environ.get("RAPIDAPI_HOST") or "").strip()
     rapid_endpoint = (os.environ.get("RAPIDAPI_ENDPOINT") or "").strip()
 
     if not rapid_key or not rapid_host or not rapid_endpoint:
-        return False, "RAPIDAPI_KEY, RAPIDAPI_HOST, dan RAPIDAPI_ENDPOINT belum diisi di Railway."
-
-    vid_id = extract_video_id(yt_url)
-    if not vid_id:
-        return False, "ID video YouTube tidak valid."
+        return False, "Variabel RapidAPI belum diatur."
 
     headers = {
         "Content-Type": "application/json",
@@ -70,90 +148,69 @@ def download_via_rapidapi(yt_url, video_path):
         "x-rapidapi-host": rapid_host
     }
 
-    # Cukup 1x POST awal dengan kualitas 480p agar konversi cepat & hemat kuota
-    body = {"id": vid_id, "type": "merged", "quality": "480p"}
+    body = {
+        "id": vid_id,
+        "type": "merged",
+        "quality": "480p",
+        "fps": 30,
+        "vcodec": "h264",
+        "acodec": "aac",
+        "container": "mp4",
+        "lang": "id"
+    }
 
     try:
         resp = requests.post(rapid_endpoint, headers=headers, json=body, timeout=45)
         if resp.status_code not in (200, 201, 202):
-            return False, f"HTTP {resp.status_code}: {resp.text[:250]}"
+            return False, f"RapidAPI HTTP {resp.status_code}: {resp.text[:180]}"
 
         data = resp.json()
         candidates = collect_candidate_urls(data)
         uid = data.get("uid")
 
-        # Jika masih IN_QUEUE / PROCESSING, pantau statusnya hingga maksimal 2 menit (24 x 5 detik)
         if not candidates and uid:
             base_api = rapid_endpoint.rsplit("/", 1)[0]
-            status_endpoints = [
+            status_checks = [
                 ("GET", f"{base_api}/status/{uid}", None),
                 ("GET", f"{base_api}/status", {"uid": uid}),
-                ("POST", rapid_endpoint, body)
+                ("GET", f"{base_api}/info", {"uid": uid}),
+                ("POST", f"{base_api}/status", {"uid": uid})
             ]
-
-            for _ in range(24):
+            for _ in range(18):
                 time.sleep(5)
-                polled = False
-                for m_type, s_url, s_payload in status_endpoints:
+                for m_type, s_url, s_params in status_checks:
                     try:
                         if m_type == "GET":
-                            s_resp = requests.get(s_url, headers=headers, params=s_payload, timeout=30)
+                            sr = requests.get(s_url, headers=headers, params=s_params, timeout=25)
                         else:
-                            s_resp = requests.post(s_url, headers=headers, json=s_payload, timeout=30)
-
-                        if s_resp.status_code == 200:
-                            data = s_resp.json()
-                            polled = True
+                            sr = requests.post(s_url, headers=headers, json=s_params, timeout=25)
+                        if sr.status_code == 200:
+                            data = sr.json()
+                            candidates = collect_candidate_urls(data)
                             break
                     except Exception:
                         continue
-
-                if not polled:
-                    continue
-
-                candidates = collect_candidate_urls(data)
                 if candidates:
                     break
-
-                state_val = str(data.get("state") or data.get("status") or "").upper()
-                err_val = data.get("error")
-                if state_val in ("FAILED", "ERROR") or (err_val and str(err_val).lower() != "none"):
-                    return False, f"Konversi gagal di server API: {str(data)[:250]}"
+                st = str(data.get("state") or data.get("status") or "").upper()
+                if st in ("FAILED", "ERROR"):
+                    break
 
         if not candidates:
-            return False, f"Timeout menunggu konversi selesai. Respons terakhir: {str(data)[:250]}"
+            return False, f"Opachi masih antre/tidak mengembalikan link ({str(data)[:160]})"
 
         non_gv = [u for u in candidates if "googlevideo.com" not in u]
         gv_bypass = [u for u in candidates if "googlevideo.com" in u and "ipbypass=yes" in u]
-        ordered_urls = non_gv + gv_bypass if (non_gv or gv_bypass) else candidates
+        ordered = non_gv + gv_bypass if (non_gv or gv_bypass) else candidates
 
-        last_dl_err = "Gagal mengunduh file dari downloadUrl."
-        for dl_url in ordered_urls[:5]:
-            try:
-                with requests.get(dl_url, stream=True, timeout=240, headers={"User-Agent": "Mozilla/5.0"}) as vid_r:
-                    if vid_r.status_code != 200:
-                        last_dl_err = f"CDN mengembalikan HTTP {vid_r.status_code}"
-                        continue
-                    ctype = str(vid_r.headers.get("Content-Type") or "").lower()
-                    if "text/html" in ctype or "application/json" in ctype:
-                        last_dl_err = f"CDN mengembalikan {ctype}, bukan file MP4."
-                        continue
-                    with open(video_path, "wb") as f:
-                        for chunk in vid_r.iter_content(chunk_size=1024 * 256):
-                            if chunk:
-                                f.write(chunk)
+        for dl_url in ordered[:5]:
+            ok, _ = stream_download_file(dl_url, video_path)
+            if ok:
+                return True, ""
 
-                if os.path.exists(video_path) and os.path.getsize(video_path) > 100000:
-                    return True, ""
-                last_dl_err = "File MP4 terunduh terlalu kecil (<100KB)."
-            except Exception as dl_e:
-                last_dl_err = str(dl_e)
-                continue
-
-        return False, last_dl_err
-
+        return False, "Gagal mengunduh file MP4 dari URL RapidAPI."
     except Exception as e:
-        return False, f"Request error: {str(e)}"
+        return False, str(e)
 
 
 def extract_audio(video_path, audio_path):
@@ -169,15 +226,40 @@ def extract_audio(video_path, audio_path):
 
 
 def download_youtube(url, job_id):
+    vid_id = extract_video_id(url)
+    if not vid_id:
+        raise RuntimeError("Link YouTube tidak valid. Pastikan formatnya https://www.youtube.com/watch?v=...")
+
     video_path = os.path.join(DOWNLOAD_DIR, f"{job_id}.mp4")
     audio_path = os.path.join(DOWNLOAD_DIR, f"{job_id}.mp3")
 
-    ok_rapid, rapid_err = download_via_rapidapi(url, video_path)
-    if not ok_rapid:
-        raise RuntimeError(f"Gagal mengambil video dari YouTube: {rapid_err}")
+    # Jalur 1: Public Cobalt / Piped Mirrors (Gratis tanpa batas kuota)
+    ok_pub, pub_err = download_via_public_mirrors(url, vid_id, video_path)
+    if ok_pub:
+        extract_audio(video_path, audio_path)
+        return video_path, audio_path
 
-    extract_audio(video_path, audio_path)
-    return video_path, audio_path
+    # Jalur 2: RapidAPI
+    ok_rapid, rapid_err = download_via_rapidapi(url, vid_id, video_path)
+    if ok_rapid:
+        extract_audio(video_path, audio_path)
+        return video_path, audio_path
+
+    # Jalur 3: yt-dlp fallback
+    cmd_vid = [
+        "yt-dlp",
+        "--no-playlist",
+        "--extractor-args", "youtube:player_client=tv_embedded,android_vr",
+        "-f", "best[height<=480][ext=mp4]/best[ext=mp4]/best",
+        "-o", video_path,
+        url
+    ]
+    res = subprocess.run(cmd_vid, capture_output=True, text=True)
+    if res.returncode == 0 and os.path.exists(video_path) and os.path.getsize(video_path) > 100000:
+        extract_audio(video_path, audio_path)
+        return video_path, audio_path
+
+    raise RuntimeError(f"Semua jalur unduh gagal. Mirror: ({pub_err}) | RapidAPI: ({rapid_err})")
 
 
 def transcribe_groq(audio_path, groq_key):
