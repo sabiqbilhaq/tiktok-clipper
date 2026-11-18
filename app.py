@@ -1,6 +1,5 @@
 import os
 import re
-import time
 import json
 import uuid
 import shutil
@@ -14,9 +13,19 @@ app = Flask(__name__)
 FFMPEG_BIN = shutil.which("ffmpeg") or os.path.abspath("bin/ffmpeg")
 DOWNLOAD_DIR = os.path.abspath("downloads")
 CLIPS_DIR = os.path.abspath("static/clips")
+COOKIES_PATH = os.path.abspath("youtube_cookies.txt")
 
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 os.makedirs(CLIPS_DIR, exist_ok=True)
+
+
+def prepare_cookies_file():
+    raw_cookies = (os.environ.get("YOUTUBE_COOKIES") or "").strip()
+    if not raw_cookies:
+        return None
+    with open(COOKIES_PATH, "w", encoding="utf-8") as f:
+        f.write(raw_cookies + "\n")
+    return COOKIES_PATH
 
 
 def extract_video_id(yt_url):
@@ -30,187 +39,6 @@ def extract_video_id(yt_url):
         if m:
             return m.group(1)
     return ""
-
-
-def collect_candidate_urls(obj, found=None):
-    if found is None:
-        found = []
-    if isinstance(obj, str):
-        if obj.startswith("http") and "youtube.com" not in obj and "youtu.be" not in obj:
-            found.append(obj)
-    elif isinstance(obj, dict):
-        priority_keys = ["downloadUrl", "download_url", "dlink", "mp4", "link", "url", "file", "result"]
-        for k in priority_keys:
-            if k in obj:
-                collect_candidate_urls(obj[k], found)
-        for k, v in obj.items():
-            if k not in priority_keys:
-                collect_candidate_urls(v, found)
-    elif isinstance(obj, list):
-        for item in obj:
-            collect_candidate_urls(item, found)
-    return found
-
-
-def stream_download_file(dl_url, dest_path, referer=None):
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-    }
-    if referer:
-        headers["Referer"] = referer
-    with requests.get(dl_url, stream=True, timeout=240, headers=headers) as r:
-        if r.status_code != 200:
-            return False, f"HTTP {r.status_code}"
-        ctype = str(r.headers.get("Content-Type") or "").lower()
-        if "text/html" in ctype or "application/json" in ctype:
-            return False, f"Bukan file media ({ctype})"
-        with open(dest_path, "wb") as f:
-            for chunk in r.iter_content(chunk_size=1024 * 256):
-                if chunk:
-                    f.write(chunk)
-    if os.path.exists(dest_path) and os.path.getsize(dest_path) > 100000:
-        return True, ""
-    return False, "Ukuran file terlalu kecil"
-
-
-def download_via_public_mirrors(yt_url, vid_id, video_path):
-    """Jalur 1: Gratis tanpa kuota lewat Cobalt instances & Piped API."""
-    cobalt_instances = [
-        "https://api.cobalt.tools/",
-        "https://cobalt-api.kwiatekmiki.com/",
-        "https://cobalt.canine.tools/",
-        "https://cbl.bloat.cat/"
-    ]
-    c_headers = {
-        "Accept": "application/json",
-        "Content-Type": "application/json",
-        "User-Agent": "Mozilla/5.0"
-    }
-    c_payload = {
-        "url": yt_url,
-        "videoQuality": "480",
-        "filenameStyle": "basic"
-    }
-    for ep in cobalt_instances:
-        try:
-            r = requests.post(ep, json=c_payload, headers=c_headers, timeout=20)
-            if r.status_code == 200:
-                data = r.json()
-                dl_url = data.get("url")
-                if dl_url:
-                    ok, _ = stream_download_file(dl_url, video_path)
-                    if ok:
-                        return True, ""
-        except Exception:
-            continue
-
-    # Piped API public instances (menyediakan video stream ter-proxy bebas blokir IP)
-    piped_instances = [
-        "https://pipedapi.kavin.rocks",
-        "https://pipedapi.tokhmi.xyz",
-        "https://pipedapi.moomoo.me",
-        "https://api.piped.projectsegfau.lt"
-    ]
-    for p_base in piped_instances:
-        try:
-            r = requests.get(f"{p_base}/streams/{vid_id}", timeout=20, headers={"User-Agent": "Mozilla/5.0"})
-            if r.status_code != 200:
-                continue
-            pdata = r.json()
-            v_streams = pdata.get("videoStreams") or []
-            # Pilih video MP4 yang sudah ada audionya (videoOnly == False)
-            merged_streams = [
-                s for s in v_streams
-                if not s.get("videoOnly") and "mp4" in str(s.get("mimeType") or "").lower() and s.get("url")
-            ]
-            for st in merged_streams:
-                ok, _ = stream_download_file(st["url"], video_path)
-                if ok:
-                    return True, ""
-        except Exception:
-            continue
-
-    return False, "Mirror publik sedang sibuk."
-
-
-def download_via_rapidapi(yt_url, vid_id, video_path):
-    """Jalur 2: RapidAPI Opachi dengan payload lengkap & status polling uid."""
-    rapid_key = (os.environ.get("RAPIDAPI_KEY") or "").strip()
-    rapid_host = (os.environ.get("RAPIDAPI_HOST") or "").strip()
-    rapid_endpoint = (os.environ.get("RAPIDAPI_ENDPOINT") or "").strip()
-
-    if not rapid_key or not rapid_host or not rapid_endpoint:
-        return False, "Variabel RapidAPI belum diatur."
-
-    headers = {
-        "Content-Type": "application/json",
-        "x-rapidapi-key": rapid_key,
-        "x-rapidapi-host": rapid_host
-    }
-
-    body = {
-        "id": vid_id,
-        "type": "merged",
-        "quality": "480p",
-        "fps": 30,
-        "vcodec": "h264",
-        "acodec": "aac",
-        "container": "mp4",
-        "lang": "id"
-    }
-
-    try:
-        resp = requests.post(rapid_endpoint, headers=headers, json=body, timeout=45)
-        if resp.status_code not in (200, 201, 202):
-            return False, f"RapidAPI HTTP {resp.status_code}: {resp.text[:180]}"
-
-        data = resp.json()
-        candidates = collect_candidate_urls(data)
-        uid = data.get("uid")
-
-        if not candidates and uid:
-            base_api = rapid_endpoint.rsplit("/", 1)[0]
-            status_checks = [
-                ("GET", f"{base_api}/status/{uid}", None),
-                ("GET", f"{base_api}/status", {"uid": uid}),
-                ("GET", f"{base_api}/info", {"uid": uid}),
-                ("POST", f"{base_api}/status", {"uid": uid})
-            ]
-            for _ in range(18):
-                time.sleep(5)
-                for m_type, s_url, s_params in status_checks:
-                    try:
-                        if m_type == "GET":
-                            sr = requests.get(s_url, headers=headers, params=s_params, timeout=25)
-                        else:
-                            sr = requests.post(s_url, headers=headers, json=s_params, timeout=25)
-                        if sr.status_code == 200:
-                            data = sr.json()
-                            candidates = collect_candidate_urls(data)
-                            break
-                    except Exception:
-                        continue
-                if candidates:
-                    break
-                st = str(data.get("state") or data.get("status") or "").upper()
-                if st in ("FAILED", "ERROR"):
-                    break
-
-        if not candidates:
-            return False, f"Opachi masih antre/tidak mengembalikan link ({str(data)[:160]})"
-
-        non_gv = [u for u in candidates if "googlevideo.com" not in u]
-        gv_bypass = [u for u in candidates if "googlevideo.com" in u and "ipbypass=yes" in u]
-        ordered = non_gv + gv_bypass if (non_gv or gv_bypass) else candidates
-
-        for dl_url in ordered[:5]:
-            ok, _ = stream_download_file(dl_url, video_path)
-            if ok:
-                return True, ""
-
-        return False, "Gagal mengunduh file MP4 dari URL RapidAPI."
-    except Exception as e:
-        return False, str(e)
 
 
 def extract_audio(video_path, audio_path):
@@ -230,36 +58,32 @@ def download_youtube(url, job_id):
     if not vid_id:
         raise RuntimeError("Link YouTube tidak valid. Pastikan formatnya https://www.youtube.com/watch?v=...")
 
+    clean_url = f"https://www.youtube.com/watch?v={vid_id}"
     video_path = os.path.join(DOWNLOAD_DIR, f"{job_id}.mp4")
     audio_path = os.path.join(DOWNLOAD_DIR, f"{job_id}.mp3")
 
-    # Jalur 1: Public Cobalt / Piped Mirrors (Gratis tanpa batas kuota)
-    ok_pub, pub_err = download_via_public_mirrors(url, vid_id, video_path)
-    if ok_pub:
-        extract_audio(video_path, audio_path)
-        return video_path, audio_path
+    cookie_file = prepare_cookies_file()
+    if not cookie_file:
+        raise RuntimeError("Variable YOUTUBE_COOKIES belum diisi di Railway!")
 
-    # Jalur 2: RapidAPI
-    ok_rapid, rapid_err = download_via_rapidapi(url, vid_id, video_path)
-    if ok_rapid:
-        extract_audio(video_path, audio_path)
-        return video_path, audio_path
-
-    # Jalur 3: yt-dlp fallback
     cmd_vid = [
         "yt-dlp",
         "--no-playlist",
-        "--extractor-args", "youtube:player_client=tv_embedded,android_vr",
-        "-f", "best[height<=480][ext=mp4]/best[ext=mp4]/best",
+        "--cookies", cookie_file,
+        "--js-runtimes", "node",
+        "-f", "bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/best[height<=720][ext=mp4]/best[ext=mp4]/best",
+        "--merge-output-format", "mp4",
         "-o", video_path,
-        url
+        clean_url
     ]
-    res = subprocess.run(cmd_vid, capture_output=True, text=True)
-    if res.returncode == 0 and os.path.exists(video_path) and os.path.getsize(video_path) > 100000:
-        extract_audio(video_path, audio_path)
-        return video_path, audio_path
 
-    raise RuntimeError(f"Semua jalur unduh gagal. Mirror: ({pub_err}) | RapidAPI: ({rapid_err})")
+    res = subprocess.run(cmd_vid, capture_output=True, text=True)
+    if res.returncode != 0 or not os.path.exists(video_path) or os.path.getsize(video_path) < 100000:
+        err_tail = (res.stderr or res.stdout or "Unknown yt-dlp error").strip()[-450:]
+        raise RuntimeError(f"yt-dlp gagal mengunduh video: {err_tail}")
+
+    extract_audio(video_path, audio_path)
+    return video_path, audio_path
 
 
 def transcribe_groq(audio_path, groq_key):
