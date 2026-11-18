@@ -2,6 +2,7 @@ import os
 import re
 import json
 import uuid
+import base64
 import shutil
 import traceback
 import subprocess
@@ -23,8 +24,16 @@ def prepare_cookies_file():
     raw_cookies = (os.environ.get("YOUTUBE_COOKIES") or "").strip()
     if not raw_cookies:
         return None
-    with open(COOKIES_PATH, "w", encoding="utf-8") as f:
-        f.write(raw_cookies + "\n")
+    # Jika formatnya Base64 (tidak diawali # Netscape), decode dulu ke teks asli
+    if not raw_cookies.startswith("#") and ".youtube.com" not in raw_cookies[:100]:
+        try:
+            decoded = base64.b64decode(raw_cookies).decode("utf-8", errors="ignore")
+            if ".youtube.com" in decoded:
+                raw_cookies = decoded
+        except Exception:
+            pass
+    with open(COOKIES_PATH, "w", encoding="utf-8", newline="\n") as f:
+        f.write(raw_cookies.strip() + "\n")
     return COOKIES_PATH
 
 
@@ -66,7 +75,6 @@ def download_youtube(url, job_id):
     if not cookie_file:
         raise RuntimeError("Variable YOUTUBE_COOKIES belum diisi di Railway!")
 
-    # Paksa codec H.264 (avc1) agar 100% kompatibel dengan FFmpeg & cepat di-render
     cmd_vid = [
         "yt-dlp",
         "--no-playlist",
