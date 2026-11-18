@@ -84,11 +84,12 @@ def download_youtube(url, job_id):
     if not cookie_file:
         raise RuntimeError("Variable YOUTUBE_COOKIES belum diisi di Railway!")
 
+    # Gunakan max 480p H.264 agar ringan di RAM container Railway (anti OOM SIGKILL -9)
     cmd_vid = [
         "yt-dlp",
         "--no-playlist",
         "--cookies", cookie_file,
-        "-f", "bv*[vcodec^=avc1][height<=720][ext=mp4]+ba[ext=m4a]/bv*[height<=720]+ba/b[height<=720]/b",
+        "-f", "bv*[vcodec^=avc1][height<=480][ext=mp4]+ba[ext=m4a]/bv*[height<=480]+ba/b[height<=480]/b",
         "--merge-output-format", "mp4",
         "-o", video_path,
         clean_url
@@ -301,16 +302,17 @@ def create_ass_subtitle(words, start_clip, end_clip, title, ass_path):
 
     duration = max(1.0, end_clip - start_clip)
 
+    # Resolusi canvas 720x1280 (9:16) agar hemat RAM dan tetap tajam di TikTok
     header = f"""[Script Info]
 ScriptType: v4.00+
-PlayResX: 1080
-PlayResY: 1920
+PlayResX: 720
+PlayResY: 1280
 WrapStyle: 1
 
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-Style: SubStyle,DejaVu Sans,64,&H00FFFFFF,&H0000FFFF,&H00000000,&H80000000,-1,0,0,0,100,100,0,0,1,5,2,2,60,60,340,1
-Style: TitleStyle,DejaVu Sans,58,&H0000FFFF,&H00FFFFFF,&H00000000,&H99000000,-1,0,0,0,100,100,0,0,3,6,0,8,70,70,180,1
+Style: SubStyle,DejaVu Sans,44,&H00FFFFFF,&H0000FFFF,&H00000000,&H80000000,-1,0,0,0,100,100,0,0,1,4,2,2,40,40,220,1
+Style: TitleStyle,DejaVu Sans,40,&H0000FFFF,&H00FFFFFF,&H00000000,&H99000000,-1,0,0,0,100,100,0,0,3,4,0,8,50,50,120,1
 
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
@@ -347,21 +349,22 @@ Dialogue: 1,0:00:00.00,{format_ass_time(duration)},TitleStyle,,0,0,0,,{title.upp
 def render_clip(video_path, ass_path, start_time, end_time, output_path):
     duration = max(1.0, end_time - start_time)
     escaped_ass = ass_path.replace("\\", "/").replace(":", "\\:")
-    vf_filter = f"crop=ih*9/16:ih:(iw-ih*9/16)/2:0,scale=1080:1920,ass='{escaped_ass}'"
+    vf_filter = f"crop=ih*9/16:ih:(iw-ih*9/16)/2:0,scale=720:1280,ass='{escaped_ass}'"
 
     cmd = [
         FFMPEG_BIN, "-y",
         "-loglevel", "warning",
+        "-threads", "2",
         "-ss", str(start_time),
         "-i", video_path,
         "-t", str(duration),
         "-vf", vf_filter,
         "-c:v", "libx264",
         "-pix_fmt", "yuv420p",
-        "-preset", "veryfast",
-        "-crf", "23",
+        "-preset", "ultrafast",
+        "-crf", "24",
         "-c:a", "aac",
-        "-b:a", "128k",
+        "-b:a", "96k",
         output_path
     ]
     res = subprocess.run(cmd, capture_output=True, text=True)
@@ -395,6 +398,8 @@ def generate():
         return jsonify({"error": "GROQ_API_KEY dan GEMINI_API_KEY wajib terisi!"}), 400
 
     job_id = str(uuid.uuid4())[:8]
+    video_path = ""
+    audio_path = ""
 
     try:
         video_path, audio_path = download_youtube(yt_url, job_id)
@@ -426,6 +431,9 @@ def generate():
             create_ass_subtitle(words, start_t, end_t, title, ass_path)
             render_clip(video_path, ass_path, start_t, end_t, out_path)
 
+            if os.path.exists(ass_path):
+                os.remove(ass_path)
+
             results.append({
                 "title": title,
                 "reason": reason,
@@ -441,6 +449,13 @@ def generate():
         tb_lines = traceback.format_exc().strip().splitlines()
         detail = " | ".join(tb_lines[-3:])
         return jsonify({"error": f"{str(e)} || DETAIL: {detail}"}), 500
+    finally:
+        for tmp_f in (video_path, audio_path):
+            if tmp_f and os.path.exists(tmp_f):
+                try:
+                    os.remove(tmp_f)
+                except Exception:
+                    pass
 
 
 if __name__ == "__main__":
