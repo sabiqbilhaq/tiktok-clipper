@@ -70,36 +70,33 @@ def download_via_rapidapi(yt_url, video_path):
         "x-rapidapi-host": rapid_host
     }
 
-    # Format body resmi Opachi: type wajib "merged" (video + audio tergabung)
     opachi_payloads = [
         {"id": vid_id, "type": "merged", "quality": "720p"},
         {"id": vid_id, "type": "merged", "quality": "480p"},
         {"id": vid_id, "type": "merged"}
     ]
 
-    last_err = ""
+    last_err = "Tidak ada respons dari server RapidAPI."
     for body in opachi_payloads:
         try:
-            data = None
             candidates = []
-            for _ in range(10):
+            for attempt in range(15):
                 resp = requests.post(rapid_endpoint, headers=headers, json=body, timeout=45)
                 if resp.status_code not in (200, 201, 202):
-                    last_err = f"HTTP {resp.status_code}: {resp.text[:200]}"
+                    last_err = f"HTTP {resp.status_code}: {resp.text[:250]}"
                     break
 
                 data = resp.json()
+                last_err = f"Respons terakhir API: {str(data)[:260]}"
                 candidates = collect_candidate_urls(data)
                 if candidates:
                     break
 
-                status_txt = str(data.get("status") or data.get("state") or data.get("message") or "").lower()
-                if any(w in status_txt for w in ["process", "queue", "pend", "wait", "convert", "start", "progress"]):
-                    time.sleep(4)
-                    continue
-                else:
-                    last_err = f"Respons API belum berisi link download: {str(data)[:220]}"
+                # Jika belum ada URL, tunggu 4 detik lalu cek status konversi lagi
+                err_flag = str(data.get("error") or data.get("status") or "").lower()
+                if "fail" in err_flag or "error" in err_flag or "invalid" in err_flag or "live" in err_flag:
                     break
+                time.sleep(4)
 
             if not candidates:
                 continue
@@ -116,6 +113,7 @@ def download_via_rapidapi(yt_url, video_path):
                             continue
                         ctype = str(vid_r.headers.get("Content-Type") or "").lower()
                         if "text/html" in ctype or "application/json" in ctype:
+                            last_err = f"CDN mengembalikan halaman {ctype}, bukan video."
                             continue
                         with open(video_path, "wb") as f:
                             for chunk in vid_r.iter_content(chunk_size=1024 * 256):
@@ -124,12 +122,13 @@ def download_via_rapidapi(yt_url, video_path):
 
                     if os.path.exists(video_path) and os.path.getsize(video_path) > 100000:
                         return True, ""
+                    last_err = "File video terunduh terlalu kecil (<100KB)."
                 except Exception as dl_e:
-                    last_err = str(dl_e)
+                    last_err = f"Error unduh CDN: {str(dl_e)}"
                     continue
 
         except Exception as e:
-            last_err = str(e)
+            last_err = f"Request error: {str(e)}"
 
     return False, last_err
 
